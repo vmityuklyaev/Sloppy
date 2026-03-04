@@ -66,18 +66,30 @@ public actor RuntimeSystem {
     private var modelProvider: (any ModelProviderPlugin)?
     private var defaultModel: String?
 
-    public init(modelProvider: (any ModelProviderPlugin)? = nil, defaultModel: String? = nil) {
+    public init(
+        modelProvider: (any ModelProviderPlugin)? = nil,
+        defaultModel: String? = nil,
+        workerExecutor: (any WorkerExecutor)? = nil
+    ) {
         let bus = EventBus()
         let memory = InMemoryMemoryStore()
         self.eventBus = bus
         self.memoryStore = memory
         self.channels = ChannelRuntime(eventBus: bus)
-        self.workers = WorkerRuntime(eventBus: bus)
+        self.workers = WorkerRuntime(
+            eventBus: bus,
+            executor: workerExecutor ?? DefaultWorkerExecutor()
+        )
         self.branches = BranchRuntime(eventBus: bus, memoryStore: memory)
         self.compactor = Compactor(eventBus: bus)
         self.visor = Visor(eventBus: bus, memoryStore: memory)
         self.modelProvider = modelProvider
         self.defaultModel = defaultModel ?? modelProvider?.models.first
+    }
+
+    /// Hot-swaps worker executor backend for subsequent worker operations.
+    public func updateWorkerExecutor(_ executor: any WorkerExecutor) async {
+        await workers.updateExecutor(executor)
     }
 
     /// Hot-swaps model provider and default model for subsequent direct responses.

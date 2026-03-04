@@ -199,6 +199,9 @@ public actor CoreService {
             guard let self else {
                 return
             }
+            await self.runtime.updateWorkerExecutor(
+                ToolExecutionWorkerExecutorAdapter(toolExecutionService: self.toolExecution)
+            )
             await self.sessionOrchestrator.updateToolInvoker { [weak self] agentID, sessionID, request in
                 guard let self else {
                     return ToolInvocationResult(
