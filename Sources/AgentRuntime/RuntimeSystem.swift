@@ -170,7 +170,7 @@ public actor RuntimeSystem {
 
         if let job = await compactor.evaluate(channelId: channelId, utilization: ingest.contextUtilization) {
             await compactor.apply(job: job, workers: workers)
-            await channels.appendSystemMessage(channelId: channelId, content: "Compactor applied \(job.level.rawValue) policy")
+            await channels.appendSystemMessage(channelId: channelId, content: "Compactor scheduled \(job.level.rawValue) policy")
         }
 
         return ingest.decision
