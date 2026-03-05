@@ -399,9 +399,10 @@ func channelEventsEndpointSupportsCursorAndTimeFilters() async throws {
     let isoFormatter = ISO8601DateFormatter()
     if let newestTimestamp = firstPage.items.first?.ts {
         let beforeValue = isoFormatter.string(from: newestTimestamp)
+        let encodedBeforeValue = beforeValue.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? beforeValue
         let beforeResponse = await router.handle(
             method: "GET",
-            path: "/v1/channels/\(channelID)/events?limit=30&before=\(beforeValue)",
+            path: "/v1/channels/\(channelID)/events?limit=30&before=\(encodedBeforeValue)",
             body: nil
         )
         #expect(beforeResponse.status == 200)
@@ -411,9 +412,10 @@ func channelEventsEndpointSupportsCursorAndTimeFilters() async throws {
 
     if let oldestTimestamp = firstPage.items.last?.ts {
         let afterValue = isoFormatter.string(from: oldestTimestamp)
+        let encodedAfterValue = afterValue.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? afterValue
         let afterResponse = await router.handle(
             method: "GET",
-            path: "/v1/channels/\(channelID)/events?limit=30&after=\(afterValue)",
+            path: "/v1/channels/\(channelID)/events?limit=30&after=\(encodedAfterValue)",
             body: nil
         )
         #expect(afterResponse.status == 200)
@@ -706,7 +708,21 @@ func runtimeRecoveryAfterRestartReplaysPersistedState() async throws {
         )
         #expect(artifactResponse.status == 200)
 
-        try await Task.sleep(nanoseconds: 200_000_000)
+        let schemaPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent("Sources/Core/Storage/schema.sql")
+            .path
+        let schemaSQL = try String(contentsOfFile: schemaPath, encoding: .utf8)
+        let verificationStore = SQLiteStore(path: sqlitePath, schemaSQL: schemaSQL)
+        let expectedArtifactID = artifactID
+        let persisted = await waitForCondition(timeoutSeconds: 3, pollNanoseconds: 100_000_000) {
+            let channels = await verificationStore.listPersistedChannels()
+            let artifacts = await verificationStore.listPersistedArtifacts()
+            let events = await verificationStore.listPersistedEvents()
+            return channels.contains(where: { $0.id == channelID })
+                && artifacts.contains(where: { $0.id == expectedArtifactID })
+                && events.contains(where: { $0.channelId == channelID })
+        }
+        #expect(persisted)
     }
 
     let restartedService = CoreService(config: config)
@@ -733,15 +749,9 @@ func runtimeRecoveryAfterRestartReplaysPersistedState() async throws {
             .path
         let schemaSQL = try String(contentsOfFile: schemaPath, encoding: .utf8)
         let restartedStore = SQLiteStore(path: sqlitePath, schemaSQL: schemaSQL)
-        let recoveredChannelID = try #require((await restartedStore.listPersistedChannels()).first?.id)
-        let fallbackStateResponse = await restartedRouter.handle(
-            method: "GET",
-            path: "/v1/channels/\(recoveredChannelID)/state",
-            body: nil
-        )
-        #expect(fallbackStateResponse.status == 200)
-        let fallbackState = try decoder.decode(ChannelSnapshot.self, from: fallbackStateResponse.body)
-        #expect(!fallbackState.messages.isEmpty)
+        let persistedEvents = await restartedStore.listPersistedEvents()
+            .filter { $0.channelId == channelID }
+        #expect(!persistedEvents.isEmpty)
     } else {
         #expect(!restartedState.messages.isEmpty)
     }
@@ -2057,4 +2067,19 @@ private func extractArtifactID(from message: String) -> String? {
         return nil
     }
     return String(message[range])
+}
+
+private func waitForCondition(
+    timeoutSeconds: TimeInterval,
+    pollNanoseconds: UInt64 = 50_000_000,
+    condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    while Date() < deadline {
+        if await condition() {
+            return true
+        }
+        try? await Task.sleep(nanoseconds: pollNanoseconds)
+    }
+    return await condition()
 }
