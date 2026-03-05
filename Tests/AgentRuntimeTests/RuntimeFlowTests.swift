@@ -300,6 +300,22 @@ func respondInlineIncludesBootstrapContextInPrompt() async {
     #expect(prompt.contains("привет, как тебя зовут?"))
 }
 
+@Test
+func appendSystemMessagePublishesChannelMessageEvent() async {
+    let system = RuntimeSystem()
+    let stream = await system.eventBus.subscribe()
+
+    await system.appendSystemMessage(
+        channelId: "recovery-channel",
+        content: "Recovered bootstrap context"
+    )
+
+    let event = await firstEvent(matching: .channelMessageReceived, in: stream)
+    #expect(event?.channelId == "recovery-channel")
+    #expect(event?.payload.objectValue["userId"]?.stringValue == "system")
+    #expect(event?.payload.objectValue["message"]?.stringValue == "Recovered bootstrap context")
+}
+
 private actor BlockingCompactionApplier {
     private var attemptsByLevel: [String: Int] = [:]
     private var isFirstAttemptBlocked = false

@@ -86,11 +86,16 @@ public actor ChannelRuntime {
     }
 
     /// Appends a synthetic system message into channel history.
-    public func appendSystemMessage(channelId: String, content: String) {
+    public func appendSystemMessage(channelId: String, content: String) async {
         var state = channels[channelId, default: ChannelState()]
         state.messages.append(ChannelMessageEntry(userId: "system", content: content))
         state.contextUtilization = estimateUtilization(state.messages)
         channels[channelId] = state
+
+        await publish(channelId: channelId, messageType: .channelMessageReceived, payload: [
+            "userId": .string("system"),
+            "message": .string(content)
+        ])
     }
 
     /// Marks worker as active for a channel.
@@ -108,14 +113,14 @@ public actor ChannelRuntime {
     }
 
     /// Writes branch conclusion digest into channel history.
-    public func applyBranchConclusion(channelId: String, conclusion: BranchConclusion) {
-        appendSystemMessage(channelId: channelId, content: "Branch conclusion: \(conclusion.summary)")
+    public func applyBranchConclusion(channelId: String, conclusion: BranchConclusion) async {
+        await appendSystemMessage(channelId: channelId, content: "Branch conclusion: \(conclusion.summary)")
     }
 
     /// Broadcasts visor digest to all known channels.
-    public func applyBulletinDigest(_ digest: String) {
+    public func applyBulletinDigest(_ digest: String) async {
         for key in channels.keys {
-            appendSystemMessage(channelId: key, content: "[Visor] \(digest)")
+            await appendSystemMessage(channelId: key, content: "[Visor] \(digest)")
         }
     }
 
