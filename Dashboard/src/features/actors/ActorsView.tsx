@@ -175,6 +175,16 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function normalizeWheelDelta(delta, deltaMode, pageSize) {
+  if (deltaMode === 1) {
+    return delta * 16;
+  }
+  if (deltaMode === 2) {
+    return delta * pageSize;
+  }
+  return delta;
+}
+
 function uniqueId(prefix, existing) {
   if (!existing.has(prefix)) {
     return prefix;
@@ -313,6 +323,11 @@ export function ActorsView() {
   const dragMovedRef = useRef(false);
   const viewTransformRef = useRef(viewTransform);
 
+  function applyViewTransform(next) {
+    viewTransformRef.current = next;
+    setViewTransform(next);
+  }
+
   useEffect(() => {
     boardRef.current = board;
   }, [board]);
@@ -356,9 +371,7 @@ export function ActorsView() {
     const scale = Math.min(rect.width / cw, rect.height / ch, 1.5);
     const x = (rect.width - cw * scale) / 2 - (minX - PAD) * scale;
     const y = (rect.height - ch * scale) / 2 - (minY - PAD) * scale;
-    const vt = { x, y, scale };
-    viewTransformRef.current = vt;
-    setViewTransform(vt);
+    applyViewTransform({ x, y, scale });
   }
 
   useEffect(() => {
@@ -405,19 +418,35 @@ export function ActorsView() {
     function handleWheel(e) {
       e.preventDefault();
       const rect = el.getBoundingClientRect();
+      const vt = viewTransformRef.current;
+      const deltaX = normalizeWheelDelta(e.deltaX, e.deltaMode, rect.width);
+      const deltaY = normalizeWheelDelta(e.deltaY, e.deltaMode, rect.height);
+      const shouldZoom = e.shiftKey || e.ctrlKey;
+
+      if (!shouldZoom) {
+        applyViewTransform({
+          ...vt,
+          x: vt.x - deltaX,
+          y: vt.y - deltaY
+        });
+        return;
+      }
+
+      const dominantDelta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY : deltaX;
+      if (dominantDelta === 0) {
+        return;
+      }
+
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
-      const vt = viewTransformRef.current;
-      const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
-      const ns = clamp(vt.scale * factor, 0.1, 5);
-      const ratio = ns / vt.scale;
-      const next = {
+      const factor = dominantDelta < 0 ? 1.08 : 1 / 1.08;
+      const nextScale = clamp(vt.scale * factor, 0.1, 5);
+      const ratio = nextScale / vt.scale;
+      applyViewTransform({
         x: mx - (mx - vt.x) * ratio,
         y: my - (my - vt.y) * ratio,
-        scale: ns
-      };
-      viewTransformRef.current = next;
-      setViewTransform(next);
+        scale: nextScale
+      });
     }
     el.addEventListener("wheel", handleWheel, { passive: false });
     return () => el.removeEventListener("wheel", handleWheel);
@@ -428,13 +457,11 @@ export function ActorsView() {
       return undefined;
     }
     function handleMove(e) {
-      const next = {
+      applyViewTransform({
         ...viewTransformRef.current,
         x: panState.originX + (e.clientX - panState.originClientX),
         y: panState.originY + (e.clientY - panState.originClientY)
-      };
-      viewTransformRef.current = next;
-      setViewTransform(next);
+      });
     }
     function handleUp() {
       setPanState(null);
