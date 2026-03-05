@@ -2,14 +2,280 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   createAgentSession,
   deleteAgentSession,
+  fetchAgentTasks,
+  fetchProjects,
   fetchAgentSession,
   fetchAgentSessions,
+  fetchTaskByReference,
   postAgentSessionControl,
   postAgentSessionMessage,
   subscribeAgentSessionStream
 } from "../../../api";
 
 const INLINE_ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024;
+const TASK_TAG_PATTERN = /#([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)/g;
+const TASK_TAG_REMOVE_PATTERN = /(^|\s)#([A-Za-z0-9][A-Za-z0-9._-]*)(\s?)$/;
+const TASK_TAG_QUERY_VALUE_PATTERN = /^[A-Za-z0-9._-]*$/;
+
+function normalizeTaskReference(value) {
+  return String(value || "").trim();
+}
+
+function normalizeTaskRecord(record) {
+  const projectId = String(record?.projectId || "").trim();
+  const projectName = String(record?.projectName || projectId || "Project").trim() || "Project";
+  const task = record?.task && typeof record.task === "object" ? record.task : {};
+  const reference = normalizeTaskReference(task?.id);
+
+  if (!reference) {
+    return null;
+  }
+
+  const title = String(task?.title || reference).trim() || reference;
+  const status = String(task?.status || "unknown").trim() || "unknown";
+  const priority = String(task?.priority || "").trim();
+  const claimedAgentId = String(task?.claimedAgentId || "").trim();
+  const claimedActorId = String(task?.claimedActorId || "").trim();
+  const actorId = String(task?.actorId || "").trim();
+  const teamId = String(task?.teamId || "").trim();
+  const assignee = claimedAgentId || claimedActorId || actorId || teamId || "";
+  const description = String(task?.description || "").trim();
+  const updatedAt = task?.updatedAt || task?.createdAt || null;
+  const searchText = `${reference} ${title} ${projectId} ${projectName} ${status} ${assignee}`.toLowerCase();
+
+  return {
+    reference,
+    referenceLower: reference.toLowerCase(),
+    projectId,
+    projectName,
+    title,
+    status,
+    priority,
+    assignee,
+    description,
+    updatedAt,
+    searchText
+  };
+}
+
+function normalizeTaskRecordsFromProjects(projects) {
+  if (!Array.isArray(projects)) {
+    return [];
+  }
+
+  const items = [];
+  for (const project of projects) {
+    const projectId = String(project?.id || "").trim();
+    const projectName = String(project?.name || projectId || "Project").trim() || "Project";
+    const tasks = Array.isArray(project?.tasks) ? project.tasks : [];
+    for (const task of tasks) {
+      const normalized = normalizeTaskRecord({
+        projectId,
+        projectName,
+        task
+      });
+      if (normalized) {
+        items.push(normalized);
+      }
+    }
+  }
+
+  return items;
+}
+
+function parseDateValue(value) {
+  const date = new Date(value || 0).getTime();
+  if (Number.isNaN(date)) {
+    return 0;
+  }
+  return date;
+}
+
+function mergeTaskRecords(previous, incoming) {
+  const map = new Map();
+
+  for (const item of previous) {
+    if (item?.referenceLower) {
+      map.set(item.referenceLower, item);
+    }
+  }
+  for (const item of incoming) {
+    if (item?.referenceLower) {
+      map.set(item.referenceLower, item);
+    }
+  }
+
+  return [...map.values()].sort((left, right) => {
+    const dateDiff = parseDateValue(right.updatedAt) - parseDateValue(left.updatedAt);
+    if (dateDiff !== 0) {
+      return dateDiff;
+    }
+    return left.reference.localeCompare(right.reference, undefined, { sensitivity: "base" });
+  });
+}
+
+function splitTextByTaskTags(value) {
+  const text = String(value || "");
+  if (!text) {
+    return [{ kind: "text", value: "" }];
+  }
+
+  const parts = [];
+  let cursor = 0;
+  let match;
+
+  TASK_TAG_PATTERN.lastIndex = 0;
+  match = TASK_TAG_PATTERN.exec(text);
+  while (match) {
+    const full = match[0];
+    const reference = normalizeTaskReference(match[1]);
+    const start = match.index;
+    const end = start + full.length;
+    const previousChar = start > 0 ? text[start - 1] : "";
+
+    if (previousChar && /[A-Za-z0-9_-]/.test(previousChar)) {
+      match = TASK_TAG_PATTERN.exec(text);
+      continue;
+    }
+
+    if (start > cursor) {
+      parts.push({ kind: "text", value: text.slice(cursor, start) });
+    }
+
+    parts.push({ kind: "task", reference, value: full });
+    cursor = end;
+    match = TASK_TAG_PATTERN.exec(text);
+  }
+
+  if (cursor < text.length) {
+    parts.push({ kind: "text", value: text.slice(cursor) });
+  }
+
+  return parts.length > 0 ? parts : [{ kind: "text", value: text }];
+}
+
+function getTaskQueryAtCursor(value, caret) {
+  const text = String(value || "");
+  const safeCaret = Math.max(0, Math.min(Number.isFinite(caret) ? caret : text.length, text.length));
+  const hashIndex = text.lastIndexOf("#", Math.max(0, safeCaret - 1));
+
+  if (hashIndex < 0) {
+    return null;
+  }
+
+  const charBeforeHash = hashIndex > 0 ? text[hashIndex - 1] : "";
+  if (charBeforeHash && !/\s|[([{'"`]/.test(charBeforeHash)) {
+    return null;
+  }
+
+  const queryBeforeCaret = text.slice(hashIndex + 1, safeCaret);
+  if (/\s/.test(queryBeforeCaret)) {
+    return null;
+  }
+
+  let tokenEnd = safeCaret;
+  while (tokenEnd < text.length && !/\s/.test(text[tokenEnd])) {
+    tokenEnd += 1;
+  }
+
+  const fullTokenValue = text.slice(hashIndex + 1, tokenEnd);
+  if (!TASK_TAG_QUERY_VALUE_PATTERN.test(fullTokenValue)) {
+    return null;
+  }
+
+  return {
+    start: hashIndex,
+    end: tokenEnd,
+    query: queryBeforeCaret
+  };
+}
+
+function findBackwardTaskTag(value, caret) {
+  const text = String(value || "");
+  const safeCaret = Math.max(0, Math.min(Number.isFinite(caret) ? caret : text.length, text.length));
+  const beforeCaret = text.slice(0, safeCaret);
+  const match = beforeCaret.match(TASK_TAG_REMOVE_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  const prefix = match[1] || "";
+  const full = match[0];
+  const reference = normalizeTaskReference(match[2]);
+  const start = beforeCaret.length - full.length + prefix.length;
+  const end = beforeCaret.length;
+
+  return {
+    start,
+    end,
+    reference
+  };
+}
+
+function scoreTaskSuggestion(task, queryLower) {
+  if (!queryLower) {
+    return 5;
+  }
+
+  const referenceLower = task.referenceLower;
+  const titleLower = task.title.toLowerCase();
+  if (referenceLower === queryLower) {
+    return 0;
+  }
+  if (referenceLower.startsWith(queryLower)) {
+    return 1;
+  }
+  if (referenceLower.includes(queryLower)) {
+    return 2;
+  }
+  if (titleLower.startsWith(queryLower)) {
+    return 3;
+  }
+  if (task.searchText.includes(queryLower)) {
+    return 4;
+  }
+  return 99;
+}
+
+function filterTaskSuggestions(tasks, query, limit = 8) {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  return tasks
+    .map((task) => ({ task, score: scoreTaskSuggestion(task, normalizedQuery) }))
+    .filter((item) => item.score < 99)
+    .sort((left, right) => {
+      if (left.score !== right.score) {
+        return left.score - right.score;
+      }
+      const dateDiff = parseDateValue(right.task.updatedAt) - parseDateValue(left.task.updatedAt);
+      if (dateDiff !== 0) {
+        return dateDiff;
+      }
+      return left.task.reference.localeCompare(right.task.reference, undefined, { sensitivity: "base" });
+    })
+    .slice(0, limit)
+    .map((item) => item.task);
+}
+
+function getTaskPreviewPosition(anchorElement) {
+  if (!anchorElement || typeof anchorElement.getBoundingClientRect !== "function") {
+    return {
+      top: 20,
+      left: 20
+    };
+  }
+
+  const rect = anchorElement.getBoundingClientRect();
+  const maxWidth = 340;
+  const estimatedHeight = 180;
+  const viewportWidth = window.innerWidth;
+  const viewportHeight = window.innerHeight;
+  const preferredTop = rect.bottom + 10;
+  const fallbackTop = rect.top - estimatedHeight - 10;
+  const top = preferredTop + estimatedHeight < viewportHeight ? preferredTop : Math.max(12, fallbackTop);
+  const left = Math.max(12, Math.min(rect.left, viewportWidth - maxWidth - 12));
+
+  return { top, left };
+}
 
 function formatEventTime(value) {
   if (!value) {
@@ -91,6 +357,218 @@ function segmentsToPlainText(segments) {
     .trim();
 }
 
+function TaskTaggedText({ text, onTaskTagClick, onTaskTagHoverStart, onTaskTagHoverEnd }) {
+  const parts = useMemo(() => splitTextByTaskTags(text), [text]);
+
+  return (
+    <>
+      {parts.map((part, index) => {
+        if (part.kind === "task") {
+          return (
+            <button
+              key={`task-${part.reference}-${index}`}
+              type="button"
+              className="agent-chat-task-tag"
+              onClick={() => onTaskTagClick(part.reference)}
+              onMouseEnter={(event) => onTaskTagHoverStart(part.reference, event.currentTarget)}
+              onMouseLeave={onTaskTagHoverEnd}
+            >
+              {part.value}
+            </button>
+          );
+        }
+        return (
+          <React.Fragment key={`text-${index}`}>
+            {part.value}
+          </React.Fragment>
+        );
+      })}
+    </>
+  );
+}
+
+const INLINE_TASK_TAG_SELECTOR = ".agent-chat-inline-task-tag";
+
+function isBlockElementNode(node) {
+  return node?.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || "");
+}
+
+function readEditorNodeText(node) {
+  if (!node) {
+    return "";
+  }
+
+  if (node.nodeType === Node.TEXT_NODE) {
+    return node.nodeValue || "";
+  }
+
+  if (node.nodeType !== Node.ELEMENT_NODE) {
+    return "";
+  }
+
+  const element = node;
+  if (element.matches(INLINE_TASK_TAG_SELECTOR)) {
+    return element.dataset.rawValue || element.textContent || "";
+  }
+  if (element.tagName === "BR") {
+    return "\n";
+  }
+
+  const children = Array.from(element.childNodes || []);
+  let text = "";
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index];
+    text += readEditorNodeText(child);
+    if (isBlockElementNode(child) && index < children.length - 1) {
+      text += "\n";
+    }
+  }
+  return text;
+}
+
+function normalizeEditorText(value) {
+  return String(value || "").replace(/\u00A0/g, " ");
+}
+
+function readEditorTextFromElement(root) {
+  return normalizeEditorText(readEditorNodeText(root));
+}
+
+function setEditorContentFromText(root, text) {
+  if (!root) {
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  const parts = splitTextByTaskTags(text);
+
+  for (const part of parts) {
+    if (part.kind === "task") {
+      const tag = document.createElement("span");
+      tag.className = "agent-chat-task-tag agent-chat-inline-task-tag";
+      tag.setAttribute("contenteditable", "false");
+      tag.dataset.taskReference = part.reference;
+      tag.dataset.rawValue = part.value;
+      tag.textContent = part.value;
+      fragment.appendChild(tag);
+    } else if (part.value) {
+      fragment.appendChild(document.createTextNode(part.value));
+    }
+  }
+
+  root.replaceChildren(fragment);
+}
+
+function getCaretOffsetInEditor(root) {
+  const selection = window.getSelection?.();
+  if (!root || !selection || selection.rangeCount === 0) {
+    return 0;
+  }
+
+  const range = selection.getRangeAt(0).cloneRange();
+  range.selectNodeContents(root);
+  const focusNode = selection.focusNode;
+  const focusOffset = selection.focusOffset;
+  if (!focusNode) {
+    return 0;
+  }
+
+  try {
+    range.setEnd(focusNode, focusOffset);
+  } catch {
+    return 0;
+  }
+
+  return normalizeEditorText(range.toString()).length;
+}
+
+function setCaretOffsetInEditor(root, offset) {
+  if (!root) {
+    return;
+  }
+
+  const selection = window.getSelection?.();
+  if (!selection) {
+    return;
+  }
+
+  const range = document.createRange();
+  let remaining = Math.max(0, offset);
+
+  function setToEnd() {
+    range.selectNodeContents(root);
+    range.collapse(false);
+  }
+
+  function walk(node) {
+    if (!node) {
+      return false;
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const length = (node.nodeValue || "").length;
+      if (remaining <= length) {
+        range.setStart(node, remaining);
+        range.collapse(true);
+        return true;
+      }
+      remaining -= length;
+      return false;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return false;
+    }
+
+    const element = node;
+    if (element.matches(INLINE_TASK_TAG_SELECTOR)) {
+      const length = (element.dataset.rawValue || element.textContent || "").length;
+      if (remaining <= length) {
+        range.setStartAfter(element);
+        range.collapse(true);
+        return true;
+      }
+      remaining -= length;
+      return false;
+    }
+
+    if (element.tagName === "BR") {
+      if (remaining <= 1) {
+        range.setStartAfter(element);
+        range.collapse(true);
+        return true;
+      }
+      remaining -= 1;
+      return false;
+    }
+
+    const children = Array.from(element.childNodes || []);
+    for (let index = 0; index < children.length; index += 1) {
+      const child = children[index];
+      if (walk(child)) {
+        return true;
+      }
+      if (isBlockElementNode(child) && index < children.length - 1) {
+        if (remaining <= 1) {
+          range.setStartAfter(child);
+          range.collapse(true);
+          return true;
+        }
+        remaining -= 1;
+      }
+    }
+
+    return false;
+  }
+
+  if (!walk(root)) {
+    setToEnd();
+  }
+
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 function AgentChatEvents({
   isLoadingSession,
   isSending,
@@ -98,7 +576,10 @@ function AgentChatEvents({
   latestRunStatus,
   onOpenThinkingPanel,
   onReplyToMessage,
-  onCopyMessage
+  onCopyMessage,
+  onTaskTagClick,
+  onTaskTagHoverStart,
+  onTaskTagHoverEnd
 }) {
   const scrollRef = useRef(null);
 
@@ -165,7 +646,16 @@ function AgentChatEvents({
                       );
                     }
 
-                    return <p key={key}>{segment.text || ""}</p>;
+                    return (
+                      <p key={key}>
+                        <TaskTaggedText
+                          text={segment.text || ""}
+                          onTaskTagClick={onTaskTagClick}
+                          onTaskTagHoverStart={onTaskTagHoverStart}
+                          onTaskTagHoverEnd={onTaskTagHoverEnd}
+                        />
+                      </p>
+                    );
                   })}
                 </div>
                 {role === "assistant" ? (
@@ -219,9 +709,135 @@ function AgentChatComposer({
   fileInputRef,
   textareaRef,
   replyTarget,
-  onCancelReply
+  onCancelReply,
+  availableTasks = [],
+  onTaskTagClick,
+  onTaskTagHoverStart,
+  onTaskTagHoverEnd
 }) {
   const canSend = String(inputText || "").trim().length > 0 || pendingFiles.length > 0;
+  const [caretIndex, setCaretIndex] = useState(0);
+  const [isInputFocused, setIsInputFocused] = useState(false);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const pendingCaretOffsetRef = useRef(null);
+  const taskQuery = useMemo(() => getTaskQueryAtCursor(inputText, caretIndex), [inputText, caretIndex]);
+  const taskSuggestions = useMemo(
+    () => filterTaskSuggestions(availableTasks, taskQuery?.query || ""),
+    [availableTasks, taskQuery?.query]
+  );
+  const isTaskDropdownOpen = isInputFocused && Boolean(taskQuery);
+  const editorRef = textareaRef;
+
+  useEffect(() => {
+    setActiveSuggestionIndex(0);
+  }, [taskQuery?.start, taskQuery?.query, taskSuggestions.length]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+
+    const currentText = readEditorTextFromElement(editor);
+    if (currentText !== inputText) {
+      setEditorContentFromText(editor, inputText);
+    }
+
+    if (pendingCaretOffsetRef.current != null) {
+      const nextCaret = pendingCaretOffsetRef.current;
+      pendingCaretOffsetRef.current = null;
+      editor.focus();
+      setCaretOffsetInEditor(editor, nextCaret);
+      setCaretIndex(nextCaret);
+    }
+  }, [editorRef, inputText]);
+
+  useEffect(() => {
+    setCaretIndex((current) => {
+      const max = String(inputText || "").length;
+      if (current > max) {
+        return max;
+      }
+      return current;
+    });
+  }, [inputText]);
+
+  function applyInputValue(nextValue, nextCaret) {
+    pendingCaretOffsetRef.current = nextCaret;
+    onInputTextChange(nextValue);
+  }
+
+  function applyTaskSuggestion(task) {
+    if (!taskQuery || !task?.reference) {
+      return;
+    }
+    const before = inputText.slice(0, taskQuery.start);
+    const after = inputText.slice(taskQuery.end);
+    const shouldAddSpace = after.length === 0 || !/^\s/.test(after);
+    const replacement = `#${task.reference}${shouldAddSpace ? " " : ""}`;
+    const nextValue = `${before}${replacement}${after}`;
+    const nextCaret = before.length + replacement.length;
+    applyInputValue(nextValue, nextCaret);
+  }
+
+  function updateCaretFromEditor(target) {
+    if (!target) {
+      return;
+    }
+    const nextCaret = getCaretOffsetInEditor(target);
+    setCaretIndex(nextCaret);
+  }
+
+  function findInlineTaskTagElement(target) {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+    return target.closest(INLINE_TASK_TAG_SELECTOR);
+  }
+
+  function renderTaskDropdown() {
+    if (!isTaskDropdownOpen) {
+      return null;
+    }
+
+    return (
+      <div className="agent-chat-task-dropdown" role="listbox" aria-label="Task suggestions">
+        {taskSuggestions.length === 0 ? (
+          <p className="agent-chat-task-dropdown-empty">No tasks found</p>
+        ) : (
+          taskSuggestions.map((task, index) => {
+            const isActive = index === activeSuggestionIndex;
+            return (
+              <button
+                key={task.reference}
+                type="button"
+                className={`agent-chat-task-dropdown-item ${isActive ? "active" : ""}`}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  applyTaskSuggestion(task);
+                }}
+                onMouseEnter={(event) => {
+                  setActiveSuggestionIndex(index);
+                  onTaskTagHoverStart(task.reference, event.currentTarget);
+                }}
+                onMouseLeave={onTaskTagHoverEnd}
+              >
+                <div className="agent-chat-task-dropdown-row">
+                  <strong>#{task.reference}</strong>
+                  <span>{task.status}</span>
+                </div>
+                <p>{task.title}</p>
+                <small>
+                  {task.projectName}
+                  {task.assignee ? ` · ${task.assignee}` : ""}
+                </small>
+              </button>
+            );
+          })
+        )}
+      </div>
+    );
+  }
 
   return (
     <>
@@ -239,104 +855,223 @@ function AgentChatComposer({
         </div>
       ) : null}
 
-      <form className="agent-chat-compose" onSubmit={onSend}>
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="agent-chat-file-input"
-          onChange={(event) => {
-            onAddFiles(event.target.files);
-            event.target.value = "";
-          }}
-          disabled={isSending}
-        />
+      <div className="agent-chat-compose-shell">
+        {renderTaskDropdown()}
 
-        {pendingFiles.length > 0 ? (
-        <div className="agent-chat-pending-files">
-          {pendingFiles.map((file, index) => (
-            <button key={`${file.name}-${index}`} type="button" onClick={() => onRemovePendingFile(index)}>
-              <span>{file.name}</span>
-              <span className="material-symbols-rounded" aria-hidden="true">
-                close
-              </span>
-            </button>
-          ))}
-        </div>
-      ) : null}
+        <form className="agent-chat-compose" onSubmit={onSend}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="agent-chat-file-input"
+            onChange={(event) => {
+              onAddFiles(event.target.files);
+              event.target.value = "";
+            }}
+            disabled={isSending}
+          />
 
-      <div className="agent-chat-compose-row">
-        <button
-          type="button"
-          className="agent-chat-icon-button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={isSending}
-          title="Attach files"
-        >
-          <span className="material-symbols-rounded" aria-hidden="true">
-            add
-          </span>
-        </button>
+          {pendingFiles.length > 0 ? (
+            <div className="agent-chat-pending-files">
+              {pendingFiles.map((file, index) => (
+                <button key={`${file.name}-${index}`} type="button" onClick={() => onRemovePendingFile(index)}>
+                  <span>{file.name}</span>
+                  <span className="material-symbols-rounded" aria-hidden="true">
+                    close
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : null}
 
-        <textarea
-          ref={textareaRef}
-          rows={1}
-          className="agent-chat-compose-input"
-          value={inputText}
-          onChange={(event) => onInputTextChange(event.target.value)}
-          disabled={isSending}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
-              return;
-            }
-            event.preventDefault();
-            if (!isSending && canSend) {
-              onSend();
-            }
-          }}
-          placeholder={agentId ? `Message ${agentId}...` : "Message..."}
-        />
-
-        <div className="agent-chat-compose-right">
-          <button type="button" className="agent-chat-mode-button" disabled={isSending}>
-            Автоматический
-            <span className="material-symbols-rounded" aria-hidden="true">
-              expand_more
-            </span>
-          </button>
-
-          <button
-            type="button"
-            className="agent-chat-icon-button muted"
-            disabled
-            title="Voice input is not available yet"
-          >
-            <span className="material-symbols-rounded" aria-hidden="true">
-              mic
-            </span>
-          </button>
-
-          {isSending ? (
-            <button type="button" className="agent-chat-icon-button agent-chat-send-button danger" onClick={onStop}>
-              <span className="material-symbols-rounded" aria-hidden="true">
-                stop
-              </span>
-            </button>
-          ) : (
+          <div className="agent-chat-compose-row">
             <button
-              type="submit"
-              className="agent-chat-icon-button agent-chat-send-button"
-              disabled={!canSend}
-              title="Send"
+              type="button"
+              className="agent-chat-icon-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isSending}
+              title="Attach files"
             >
               <span className="material-symbols-rounded" aria-hidden="true">
-                arrow_upward
+                add
               </span>
             </button>
-          )}
-        </div>
+
+            <div
+              ref={editorRef}
+              className="agent-chat-compose-input"
+              contentEditable={!isSending}
+              suppressContentEditableWarning
+              data-placeholder={agentId ? `Message ${agentId}...` : "Message..."}
+              role="textbox"
+              aria-multiline="true"
+              onInput={(event) => {
+                const nextText = readEditorTextFromElement(event.currentTarget);
+                onInputTextChange(nextText);
+                updateCaretFromEditor(event.currentTarget);
+              }}
+              onClick={(event) => {
+                const tagElement = findInlineTaskTagElement(event.target);
+                if (tagElement) {
+                  event.preventDefault();
+                  const reference = normalizeTaskReference(tagElement.dataset.taskReference);
+                  if (reference) {
+                    onTaskTagClick(reference);
+                  }
+                  return;
+                }
+                updateCaretFromEditor(event.currentTarget);
+              }}
+              onMouseOver={(event) => {
+                const tagElement = findInlineTaskTagElement(event.target);
+                if (!tagElement) {
+                  return;
+                }
+                const relatedElement = findInlineTaskTagElement(event.relatedTarget);
+                if (relatedElement === tagElement) {
+                  return;
+                }
+                const reference = normalizeTaskReference(tagElement.dataset.taskReference);
+                if (!reference) {
+                  return;
+                }
+                onTaskTagHoverStart(reference, tagElement);
+              }}
+              onMouseOut={(event) => {
+                const tagElement = findInlineTaskTagElement(event.target);
+                if (!tagElement) {
+                  return;
+                }
+                const relatedElement = findInlineTaskTagElement(event.relatedTarget);
+                if (relatedElement === tagElement) {
+                  return;
+                }
+                onTaskTagHoverEnd();
+              }}
+              onKeyUp={(event) => updateCaretFromEditor(event.currentTarget)}
+              onFocus={(event) => {
+                setIsInputFocused(true);
+                updateCaretFromEditor(event.currentTarget);
+              }}
+              onBlur={() => {
+                setIsInputFocused(false);
+              }}
+              onKeyDown={(event) => {
+                const target = event.currentTarget;
+                const hasSuggestions = taskSuggestions.length > 0;
+
+                if (isTaskDropdownOpen) {
+                  if (event.key === "ArrowDown" && hasSuggestions) {
+                    event.preventDefault();
+                    setActiveSuggestionIndex((current) => (current + 1) % taskSuggestions.length);
+                    return;
+                  }
+
+                  if (event.key === "ArrowUp" && hasSuggestions) {
+                    event.preventDefault();
+                    setActiveSuggestionIndex((current) => {
+                      if (current <= 0) {
+                        return taskSuggestions.length - 1;
+                      }
+                      return current - 1;
+                    });
+                    return;
+                  }
+
+                  if (event.key === "Enter" && hasSuggestions) {
+                    event.preventDefault();
+                    const selectedTask = taskSuggestions[Math.min(activeSuggestionIndex, taskSuggestions.length - 1)];
+                    applyTaskSuggestion(selectedTask);
+                    return;
+                  }
+
+                  if (event.key === "Tab" && hasSuggestions) {
+                    event.preventDefault();
+                    const selectedTask = taskSuggestions[Math.min(activeSuggestionIndex, taskSuggestions.length - 1)];
+                    applyTaskSuggestion(selectedTask);
+                    return;
+                  }
+
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setIsInputFocused(false);
+                    target.blur();
+                    return;
+                  }
+                }
+
+                if (
+                  event.key === "Backspace" &&
+                  !event.altKey &&
+                  !event.ctrlKey &&
+                  !event.metaKey &&
+                  window.getSelection?.()?.isCollapsed
+                ) {
+                  const resolved = findBackwardTaskTag(inputText, getCaretOffsetInEditor(target));
+                  if (resolved) {
+                    event.preventDefault();
+                    const nextValue = `${inputText.slice(0, resolved.start)}${inputText.slice(resolved.end)}`;
+                    applyInputValue(nextValue, resolved.start);
+                    return;
+                  }
+                }
+
+                if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+                  return;
+                }
+                event.preventDefault();
+                if (!isSending && canSend) {
+                  onSend();
+                }
+              }}
+              onPaste={(event) => {
+                event.preventDefault();
+                const text = event.clipboardData?.getData("text/plain") || "";
+                document.execCommand("insertText", false, text);
+              }}
+            />
+
+            <div className="agent-chat-compose-right">
+              <button type="button" className="agent-chat-mode-button" disabled={isSending}>
+                Auto
+                <span className="material-symbols-rounded" aria-hidden="true">
+                  expand_more
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className="agent-chat-icon-button muted"
+                disabled
+                title="Voice input is not available yet"
+              >
+                <span className="material-symbols-rounded" aria-hidden="true">
+                  mic
+                </span>
+              </button>
+
+              {isSending ? (
+                <button type="button" className="agent-chat-icon-button agent-chat-send-button danger" onClick={onStop}>
+                  <span className="material-symbols-rounded" aria-hidden="true">
+                    stop
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="agent-chat-icon-button agent-chat-send-button"
+                  disabled={!canSend}
+                  title="Send"
+                >
+                  <span className="material-symbols-rounded" aria-hidden="true">
+                    arrow_upward
+                  </span>
+                </button>
+              )}
+            </div>
+          </div>
+        </form>
       </div>
-    </form>
     </>
   );
 }
@@ -430,10 +1165,14 @@ export function AgentChatTab({ agentId }) {
   const [replyTarget, setReplyTarget] = useState(null);
   const [isInspectorOpen, setIsInspectorOpen] = useState(false);
   const [selectedInspectorRecordId, setSelectedInspectorRecordId] = useState(null);
+  const [knownTaskRecords, setKnownTaskRecords] = useState([]);
+  const [taskPreview, setTaskPreview] = useState(null);
   const fileInputRef = useRef(null);
   const composeInputRef = useRef(null);
   const runStateRef = useRef({ sessionId: null, abortController: null });
   const streamCleanupRef = useRef(() => {});
+  const taskRecordCacheRef = useRef(new Map());
+  const taskRecordInflightRef = useRef(new Map());
 
   useEffect(() => {
     document.body.classList.add("agent-chat-no-page-scroll");
@@ -443,6 +1182,143 @@ export function AgentChatTab({ agentId }) {
       document.body.classList.remove("agent-chat-no-page-scroll");
     };
   }, []);
+
+  function cacheTaskRecord(record) {
+    if (!record?.referenceLower) {
+      return;
+    }
+    taskRecordCacheRef.current.set(record.referenceLower, record);
+  }
+
+  function readCachedTaskRecord(taskReference) {
+    const normalizedReference = normalizeTaskReference(taskReference).toLowerCase();
+    if (!normalizedReference) {
+      return null;
+    }
+    return taskRecordCacheRef.current.get(normalizedReference) || null;
+  }
+
+  async function loadTaskRecord(taskReference) {
+    const normalizedReference = normalizeTaskReference(taskReference);
+    const cacheKey = normalizedReference.toLowerCase();
+    if (!cacheKey) {
+      return null;
+    }
+
+    const cached = taskRecordCacheRef.current.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const pending = taskRecordInflightRef.current.get(cacheKey);
+    if (pending) {
+      return pending;
+    }
+
+    const request = (async () => {
+      try {
+        const response = await fetchTaskByReference(normalizedReference);
+        const normalized = normalizeTaskRecord(response);
+        if (!normalized) {
+          return null;
+        }
+        cacheTaskRecord(normalized);
+        setKnownTaskRecords((previous) => mergeTaskRecords(previous, [normalized]));
+        return normalized;
+      } catch {
+        return null;
+      } finally {
+        taskRecordInflightRef.current.delete(cacheKey);
+      }
+    })();
+
+    taskRecordInflightRef.current.set(cacheKey, request);
+    return request;
+  }
+
+  function openTaskReference(taskReference) {
+    const normalizedReference = normalizeTaskReference(taskReference);
+    if (!normalizedReference) {
+      return;
+    }
+
+    const pathname = `/tasks/${encodeURIComponent(normalizedReference)}`;
+    const nextPath = `${pathname}${window.location.search}${window.location.hash}`;
+    if (window.location.pathname === pathname) {
+      return;
+    }
+    window.history.pushState({}, "", nextPath);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }
+
+  function handleTaskTagHoverStart(taskReference, anchorElement) {
+    const normalizedReference = normalizeTaskReference(taskReference);
+    if (!normalizedReference) {
+      return;
+    }
+
+    const position = getTaskPreviewPosition(anchorElement);
+    const cached = readCachedTaskRecord(normalizedReference);
+    setTaskPreview({
+      reference: normalizedReference,
+      ...position,
+      loading: !cached,
+      record: cached
+    });
+
+    if (cached) {
+      return;
+    }
+
+    loadTaskRecord(normalizedReference).then((record) => {
+      setTaskPreview((previous) => {
+        if (!previous || previous.reference.toLowerCase() !== normalizedReference.toLowerCase()) {
+          return previous;
+        }
+        return {
+          ...previous,
+          loading: false,
+          record: record || null
+        };
+      });
+    });
+  }
+
+  function handleTaskTagHoverEnd() {
+    setTaskPreview(null);
+  }
+
+  useEffect(() => {
+    let isCancelled = false;
+    taskRecordCacheRef.current = new Map();
+    taskRecordInflightRef.current = new Map();
+    setKnownTaskRecords([]);
+    setTaskPreview(null);
+
+    async function loadKnownTasks() {
+      const [agentTasksResponse, projectsResponse] = await Promise.all([fetchAgentTasks(agentId), fetchProjects()]);
+      if (isCancelled) {
+        return;
+      }
+
+      const normalizedFromAgent = Array.isArray(agentTasksResponse)
+        ? agentTasksResponse.map((item) => normalizeTaskRecord(item)).filter(Boolean)
+        : [];
+      const normalizedFromProjects = normalizeTaskRecordsFromProjects(projectsResponse);
+      const normalized = mergeTaskRecords(normalizedFromProjects, normalizedFromAgent);
+
+      for (const record of normalized) {
+        cacheTaskRecord(record);
+      }
+      setKnownTaskRecords(mergeTaskRecords([], normalized));
+    }
+
+    loadKnownTasks().catch(() => {});
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [agentId]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -949,7 +1825,7 @@ export function AgentChatTab({ agentId }) {
           group: "thinking",
           sourceEventKey: eventKey,
           createdAt,
-          title: thinkingSegments.length > 1 ? `Thought #${segment.segmentIndex + 1}` : "Thought",
+          title: thinkingSegments.length > 1 ? `Thought ${segment.segmentIndex + 1}` : "Thought",
           preview: previewText(text),
           text: text || "No details"
         };
@@ -1128,6 +2004,9 @@ export function AgentChatTab({ agentId }) {
             onOpenThinkingPanel={handleOpenThinkingPanel}
             onReplyToMessage={handleReplyToMessage}
             onCopyMessage={handleCopyMessage}
+            onTaskTagClick={openTaskReference}
+            onTaskTagHoverStart={handleTaskTagHoverStart}
+            onTaskTagHoverEnd={handleTaskTagHoverEnd}
           />
 
           <div className="agent-chat-compose-sticky-wrap">
@@ -1145,6 +2024,10 @@ export function AgentChatTab({ agentId }) {
               textareaRef={composeInputRef}
               replyTarget={replyTarget}
               onCancelReply={() => setReplyTarget(null)}
+              availableTasks={knownTaskRecords}
+              onTaskTagClick={openTaskReference}
+              onTaskTagHoverStart={handleTaskTagHoverStart}
+              onTaskTagHoverEnd={handleTaskTagHoverEnd}
             />
 
             <p className="agent-chat-status-line placeholder-text">{statusText}</p>
@@ -1169,6 +2052,39 @@ export function AgentChatTab({ agentId }) {
           onOpenSession={openSession}
         />
       </div>
+
+      {taskPreview ? (
+        <aside
+          className="agent-chat-task-preview"
+          style={{
+            top: `${taskPreview.top}px`,
+            left: `${taskPreview.left}px`
+          }}
+          aria-hidden="true"
+        >
+          {taskPreview.loading ? (
+            <p className="agent-chat-task-preview-empty">Loading task...</p>
+          ) : taskPreview.record ? (
+            <>
+              <div className="agent-chat-task-preview-head">
+                <strong>#{taskPreview.record.reference}</strong>
+                <span>{taskPreview.record.status}</span>
+              </div>
+              <p className="agent-chat-task-preview-title">{taskPreview.record.title}</p>
+              <div className="agent-chat-task-preview-meta">
+                <span>{taskPreview.record.projectName}</span>
+                <span>{taskPreview.record.assignee || "Unassigned"}</span>
+                {taskPreview.record.priority ? <span>{taskPreview.record.priority}</span> : null}
+              </div>
+              {taskPreview.record.description ? (
+                <p className="agent-chat-task-preview-description">{taskPreview.record.description}</p>
+              ) : null}
+            </>
+          ) : (
+            <p className="agent-chat-task-preview-empty">Task not found.</p>
+          )}
+        </aside>
+      ) : null}
     </section>
   );
 }
