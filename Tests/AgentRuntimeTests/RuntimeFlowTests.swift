@@ -137,6 +137,55 @@ func branchIsEphemeralAfterConclusion() async {
 }
 
 @Test
+func validBranchConclusionPublishesConclusionEvent() async {
+    let bus = EventBus()
+    let memory = InMemoryMemoryStore()
+    let branchRuntime = BranchRuntime(eventBus: bus, memoryStore: memory)
+    let stream = await bus.subscribe()
+
+    let branchId = await branchRuntime.spawn(channelId: "general", prompt: "research topic")
+    let expectedSummary = "final summary"
+    let expectedUsage = TokenUsage(prompt: 20, completion: 10)
+    let conclusion = await branchRuntime.conclude(
+        branchId: branchId,
+        summary: expectedSummary,
+        artifactRefs: [ArtifactRef(id: "art-1", kind: "text", preview: "artifact preview")],
+        tokenUsage: expectedUsage
+    )
+
+    #expect(conclusion != nil)
+    let event = await firstEvent(matching: .branchConclusion, in: stream)
+    #expect(event?.branchId == branchId)
+    let decoded = event.flatMap { try? JSONValueCoder.decode(BranchConclusion.self, from: $0.payload) }
+    #expect(decoded?.summary == expectedSummary)
+    #expect(decoded?.tokenUsage == expectedUsage)
+}
+
+@Test
+func invalidBranchConclusionEmitsFailureEvent() async {
+    let bus = EventBus()
+    let memory = InMemoryMemoryStore()
+    let branchRuntime = BranchRuntime(eventBus: bus, memoryStore: memory)
+    let stream = await bus.subscribe()
+
+    let branchId = await branchRuntime.spawn(channelId: "general", prompt: "research topic")
+    let conclusion = await branchRuntime.conclude(
+        branchId: branchId,
+        summary: "   ",
+        artifactRefs: [ArtifactRef(id: "art-dup", kind: "text", preview: "a"), ArtifactRef(id: "art-dup", kind: "text", preview: "b")],
+        tokenUsage: TokenUsage(prompt: -1, completion: 10)
+    )
+
+    #expect(conclusion == nil)
+
+    let events = await collectEvents(in: stream)
+    let failure = events.first(where: { $0.messageType == .workerFailed && $0.branchId == branchId })
+    #expect(failure != nil)
+    #expect(failure?.payload.objectValue["code"]?.stringValue == "empty_summary")
+    #expect(!events.contains(where: { $0.messageType == .branchConclusion && $0.branchId == branchId }))
+}
+
+@Test
 func visorCreatesBulletin() async {
     let bus = EventBus()
     let memory = InMemoryMemoryStore()
@@ -327,6 +376,18 @@ private actor SleepRecorder {
     }
 }
 
+private actor EventCollector {
+    private var events: [EventEnvelope] = []
+
+    func append(_ event: EventEnvelope) {
+        events.append(event)
+    }
+
+    func all() -> [EventEnvelope] {
+        events
+    }
+}
+
 private func firstEvent(
     matching type: MessageType,
     in stream: AsyncStream<EventEnvelope>,
@@ -350,5 +411,37 @@ private func firstEvent(
         let event = await group.next() ?? nil
         group.cancelAll()
         return event
+    }
+}
+
+private func collectEvents(
+    in stream: AsyncStream<EventEnvelope>,
+    timeoutNanoseconds: UInt64 = 250_000_000
+) async -> [EventEnvelope] {
+    let collector = EventCollector()
+    let task = Task {
+        for await event in stream {
+            await collector.append(event)
+        }
+    }
+
+    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+    task.cancel()
+    return await collector.all()
+}
+
+private extension JSONValue {
+    var objectValue: [String: JSONValue] {
+        if case .object(let object) = self {
+            return object
+        }
+        return [:]
+    }
+
+    var stringValue: String? {
+        if case .string(let value) = self {
+            return value
+        }
+        return nil
     }
 }

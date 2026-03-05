@@ -1,5 +1,33 @@
 import React from "react";
 
+function parseBranchConclusion(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const summary = typeof payload.summary === "string" ? payload.summary.trim() : "";
+  const tokenUsage =
+    payload.tokenUsage && typeof payload.tokenUsage === "object" ? payload.tokenUsage : null;
+  const prompt = tokenUsage && typeof tokenUsage.prompt === "number" ? tokenUsage.prompt : null;
+  const completion =
+    tokenUsage && typeof tokenUsage.completion === "number" ? tokenUsage.completion : null;
+
+  const artifactRefs = Array.isArray(payload.artifactRefs)
+    ? payload.artifactRefs.filter((ref) => ref && typeof ref === "object")
+    : [];
+  const memoryRefs = Array.isArray(payload.memoryRefs)
+    ? payload.memoryRefs.filter((ref) => ref && typeof ref === "object")
+    : [];
+
+  return {
+    summary,
+    prompt,
+    completion,
+    artifactRefs,
+    memoryRefs
+  };
+}
+
 export function RuntimeOverviewView({
   title,
   text,
@@ -79,6 +107,35 @@ export function RuntimeOverviewView({
                 <strong>{event.messageType}</strong>
                 <p>{new Date(event.ts).toLocaleString()}</p>
                 {refs ? <p>{refs}</p> : null}
+                {event.messageType === "branch.conclusion" ? (
+                  (() => {
+                    const conclusion = parseBranchConclusion(event.payload);
+                    if (!conclusion) {
+                      return null;
+                    }
+
+                    const artifactRefIds = conclusion.artifactRefs
+                      .map((ref) => (typeof ref.id === "string" ? ref.id : null))
+                      .filter(Boolean);
+                    const memoryRefIds = conclusion.memoryRefs
+                      .map((ref) => (typeof ref.id === "string" ? ref.id : null))
+                      .filter(Boolean);
+
+                    return (
+                      <>
+                        {conclusion.summary ? <p>Summary: {conclusion.summary}</p> : null}
+                        {artifactRefIds.length > 0 ? <p>Artifacts: {artifactRefIds.join(", ")}</p> : null}
+                        {memoryRefIds.length > 0 ? <p>Memory refs: {memoryRefIds.join(", ")}</p> : null}
+                        {conclusion.prompt !== null && conclusion.completion !== null ? (
+                          <p>
+                            Token usage: prompt {conclusion.prompt}, completion {conclusion.completion}, total{" "}
+                            {conclusion.prompt + conclusion.completion}
+                          </p>
+                        ) : null}
+                      </>
+                    );
+                  })()
+                ) : null}
               </article>
             );
           })}

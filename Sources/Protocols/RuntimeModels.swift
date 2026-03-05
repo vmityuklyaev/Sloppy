@@ -57,6 +57,56 @@ public struct TokenUsage: Codable, Sendable, Equatable {
 }
 
 public struct BranchConclusion: Codable, Sendable, Equatable {
+    public enum ValidationError: Error, Sendable, Equatable {
+        case emptySummary
+        case negativePromptTokens
+        case negativeCompletionTokens
+        case excessivePromptTokens(maxAllowed: Int)
+        case excessiveCompletionTokens(maxAllowed: Int)
+        case duplicateArtifactRef(id: String)
+        case duplicateMemoryRef(id: String)
+
+        public var code: String {
+            switch self {
+            case .emptySummary:
+                return "empty_summary"
+            case .negativePromptTokens:
+                return "negative_prompt_tokens"
+            case .negativeCompletionTokens:
+                return "negative_completion_tokens"
+            case .excessivePromptTokens:
+                return "excessive_prompt_tokens"
+            case .excessiveCompletionTokens:
+                return "excessive_completion_tokens"
+            case .duplicateArtifactRef:
+                return "duplicate_artifact_ref"
+            case .duplicateMemoryRef:
+                return "duplicate_memory_ref"
+            }
+        }
+
+        public var message: String {
+            switch self {
+            case .emptySummary:
+                return "Branch conclusion summary must not be empty."
+            case .negativePromptTokens:
+                return "Branch conclusion prompt token usage must be non-negative."
+            case .negativeCompletionTokens:
+                return "Branch conclusion completion token usage must be non-negative."
+            case .excessivePromptTokens(let maxAllowed):
+                return "Branch conclusion prompt token usage exceeds sane limit (\(maxAllowed))."
+            case .excessiveCompletionTokens(let maxAllowed):
+                return "Branch conclusion completion token usage exceeds sane limit (\(maxAllowed))."
+            case .duplicateArtifactRef(let id):
+                return "Branch conclusion has duplicate artifact ref id '\(id)'."
+            case .duplicateMemoryRef(let id):
+                return "Branch conclusion has duplicate memory ref id '\(id)'."
+            }
+        }
+    }
+
+    public static let defaultMaxTokenCount: Int = 1_000_000
+
     public var summary: String
     public var artifactRefs: [ArtifactRef]
     public var memoryRefs: [MemoryRef]
@@ -67,6 +117,40 @@ public struct BranchConclusion: Codable, Sendable, Equatable {
         self.artifactRefs = artifactRefs
         self.memoryRefs = memoryRefs
         self.tokenUsage = tokenUsage
+    }
+
+    public func validate(maxTokenCount: Int = Self.defaultMaxTokenCount) throws {
+        let normalizedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSummary.isEmpty else {
+            throw ValidationError.emptySummary
+        }
+
+        guard tokenUsage.prompt >= 0 else {
+            throw ValidationError.negativePromptTokens
+        }
+        guard tokenUsage.completion >= 0 else {
+            throw ValidationError.negativeCompletionTokens
+        }
+        guard tokenUsage.prompt <= maxTokenCount else {
+            throw ValidationError.excessivePromptTokens(maxAllowed: maxTokenCount)
+        }
+        guard tokenUsage.completion <= maxTokenCount else {
+            throw ValidationError.excessiveCompletionTokens(maxAllowed: maxTokenCount)
+        }
+
+        var artifactIDs = Set<String>()
+        for ref in artifactRefs {
+            guard artifactIDs.insert(ref.id).inserted else {
+                throw ValidationError.duplicateArtifactRef(id: ref.id)
+            }
+        }
+
+        var memoryIDs = Set<String>()
+        for ref in memoryRefs {
+            guard memoryIDs.insert(ref.id).inserted else {
+                throw ValidationError.duplicateMemoryRef(id: ref.id)
+            }
+        }
     }
 }
 

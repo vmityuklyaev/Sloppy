@@ -67,6 +67,19 @@ public actor BranchRuntime {
     ) async -> BranchConclusion? {
         guard let state = branches.removeValue(forKey: branchId) else { return nil }
 
+        let preSaveConclusion = BranchConclusion(
+            summary: summary,
+            artifactRefs: artifactRefs,
+            memoryRefs: state.recalledMemory,
+            tokenUsage: tokenUsage
+        )
+        do {
+            try preSaveConclusion.validate()
+        } catch {
+            await publishInvalidConclusion(state: state, branchId: branchId, error: error)
+            return nil
+        }
+
         let saved = await memoryStore.save(note: summary)
         let memoryRefs = state.recalledMemory + [saved]
         let conclusion = BranchConclusion(
@@ -75,6 +88,12 @@ public actor BranchRuntime {
             memoryRefs: memoryRefs,
             tokenUsage: tokenUsage
         )
+        do {
+            try conclusion.validate()
+        } catch {
+            await publishInvalidConclusion(state: state, branchId: branchId, error: error)
+            return nil
+        }
 
         if let payload = try? JSONValueCoder.encode(conclusion) {
             await eventBus.publish(
@@ -93,5 +112,25 @@ public actor BranchRuntime {
     /// Returns currently active branch count.
     public func activeBranchesCount() -> Int {
         branches.count
+    }
+
+    private func publishInvalidConclusion(state: BranchState, branchId: String, error: Error) async {
+        let validationError = error as? BranchConclusion.ValidationError
+        let code = validationError?.code ?? "invalid_branch_conclusion"
+        let message = validationError?.message ?? "Branch conclusion failed validation."
+
+        await eventBus.publish(
+            EventEnvelope(
+                messageType: .workerFailed,
+                channelId: state.channelId,
+                branchId: branchId,
+                workerId: state.workerId,
+                payload: .object([
+                    "error": .string(message),
+                    "code": .string(code),
+                    "reason": .string("invalid_branch_conclusion")
+                ])
+            )
+        )
     }
 }

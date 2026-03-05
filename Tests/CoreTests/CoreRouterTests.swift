@@ -1995,6 +1995,46 @@ func tokenUsageEndpointReturnsPersistedData() async throws {
 }
 
 @Test
+func tokenUsageEndpointPersistsBranchConclusionUsage() async throws {
+    let sqlitePath = FileManager.default.temporaryDirectory
+        .appendingPathComponent("core-token-usage-branch-\(UUID().uuidString).sqlite")
+        .path
+
+    var config = CoreConfig.default
+    config.sqlitePath = sqlitePath
+
+    let service = CoreService(config: config)
+    let router = CoreRouter(service: service)
+
+    let decision = await service.postChannelMessage(
+        channelId: "branch-usage-channel",
+        request: ChannelMessageRequest(userId: "u1", content: "research architecture options")
+    )
+    #expect(decision.action == .spawnBranch)
+
+    let hasPersistedBranchUsage = await waitForCondition(timeoutSeconds: 3) {
+        let usage = await service.listTokenUsage(channelId: "branch-usage-channel")
+        return usage.items.contains(where: { item in
+            item.promptTokens == 300 && item.completionTokens == 120
+        })
+    }
+    #expect(hasPersistedBranchUsage)
+
+    let response = await router.handle(
+        method: "GET",
+        path: "/v1/token-usage?channelId=branch-usage-channel",
+        body: nil
+    )
+    #expect(response.status == 200)
+
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let result = try decoder.decode(TokenUsageResponse.self, from: response.body)
+    #expect(result.items.contains(where: { $0.promptTokens == 300 && $0.completionTokens == 120 }))
+    #expect(result.totalTokens >= 420)
+}
+
+@Test
 func tokenUsageEndpointFiltersByChannelId() async throws {
     let sqlitePath = FileManager.default.temporaryDirectory
         .appendingPathComponent("core-token-usage-\(UUID().uuidString).sqlite")

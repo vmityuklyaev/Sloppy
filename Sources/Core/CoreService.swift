@@ -4365,21 +4365,30 @@ public actor CoreService {
 
     private func extractTokenUsageFromBranchConclusion(_ event: EventEnvelope) -> TokenUsage? {
         guard case .object(let obj) = event.payload else { return nil }
-        guard case .object(let conclusionObj)? = obj["conclusion"] else { return nil }
-        guard case .object(let tokenUsageObj)? = conclusionObj["tokenUsage"] else { return nil }
 
-        guard case .number(let prompt)? = tokenUsageObj["prompt"],
-              case .number(let completion)? = tokenUsageObj["completion"] else {
-            return nil
+        // Preferred payload shape: branch conclusion itself is in event.payload.
+        if let usage = tokenUsage(fromObjectField: obj["tokenUsage"]) {
+            return usage
         }
 
-        return TokenUsage(prompt: Int(prompt), completion: Int(completion))
+        // Backward-compatible fallback for nested payloads: { "conclusion": { "tokenUsage": ... } }.
+        if case .object(let conclusionObj)? = obj["conclusion"] {
+            return tokenUsage(fromObjectField: conclusionObj["tokenUsage"])
+        }
+
+        return nil
     }
 
     private func extractTokenUsageFromWorkerCompleted(_ event: EventEnvelope) -> TokenUsage? {
         guard case .object(let obj) = event.payload else { return nil }
         guard case .object(let resultObj)? = obj["result"] else { return nil }
-        guard case .object(let tokenUsageObj)? = resultObj["tokenUsage"] else { return nil }
+        return tokenUsage(fromObjectField: resultObj["tokenUsage"])
+    }
+
+    private func tokenUsage(fromObjectField field: JSONValue?) -> TokenUsage? {
+        guard case .object(let tokenUsageObj)? = field else {
+            return nil
+        }
 
         guard case .number(let prompt)? = tokenUsageObj["prompt"],
               case .number(let completion)? = tokenUsageObj["completion"] else {
