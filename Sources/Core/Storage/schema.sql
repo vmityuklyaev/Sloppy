@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS events (
     branch_id TEXT,
     worker_id TEXT,
     payload_json TEXT NOT NULL,
+    extensions_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
 
@@ -82,6 +83,12 @@ CREATE TABLE IF NOT EXISTS dashboard_project_tasks (
     team_id TEXT,
     claimed_actor_id TEXT,
     claimed_agent_id TEXT,
+    swarm_id TEXT,
+    swarm_task_id TEXT,
+    swarm_parent_task_id TEXT,
+    swarm_dependency_ids_json TEXT NOT NULL DEFAULT '[]',
+    swarm_depth INTEGER,
+    swarm_actor_path_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

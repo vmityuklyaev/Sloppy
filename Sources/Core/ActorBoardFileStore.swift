@@ -139,6 +139,7 @@ final class ActorBoardFileStore {
             link.id = linkID
             link.sourceActorId = sourceID
             link.targetActorId = targetID
+            link.relationship = effectiveRelationship(for: rawLink)
             links.append(link)
         }
 
@@ -339,6 +340,20 @@ final class ActorBoardFileStore {
 
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func effectiveRelationship(for link: ActorLink) -> ActorRelationshipType {
+        if let relationship = link.relationship {
+            return relationship
+        }
+
+        let sourceSocket = link.sourceSocket ?? .right
+        let targetSocket = link.targetSocket ?? .left
+        if (sourceSocket == .bottom && targetSocket == .top)
+            || (sourceSocket == .top && targetSocket == .bottom) {
+            return .hierarchical
+        }
+        return .peer
     }
 
     private func mapError(_ error: Error) -> StoreError {

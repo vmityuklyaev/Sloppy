@@ -400,6 +400,152 @@ func taskDelegationRespectsActorBoardTaskLinks() async throws {
 }
 
 @Test
+func swarmHierarchyCycleBlocksRootTask() async throws {
+    let workspaceName = "workspace-visor-swarm-cycle-\(UUID().uuidString)"
+    let sqlitePath = FileManager.default.temporaryDirectory
+        .appendingPathComponent("core-visor-swarm-cycle-\(UUID().uuidString).sqlite")
+        .path
+    var config = CoreConfig.default
+    config.workspace = .init(name: workspaceName, basePath: FileManager.default.temporaryDirectory.path)
+    config.sqlitePath = sqlitePath
+    let service = CoreService(config: config)
+    let router = CoreRouter(service: service)
+    let projectID = "visor-swarm-cycle-\(UUID().uuidString)"
+    let rootActorID = "agent:root-\(UUID().uuidString)"
+    let childActorID = "agent:child-\(UUID().uuidString)"
+
+    try await createAgent(router: router, id: rootActorID.replacingOccurrences(of: "agent:", with: ""))
+    try await createAgent(router: router, id: childActorID.replacingOccurrences(of: "agent:", with: ""))
+    try await updateActorBoard(
+        router: router,
+        nodes: [
+            ActorNode(id: "human:dispatcher", displayName: "Dispatcher", kind: .human, channelId: "general"),
+            ActorNode(id: rootActorID, displayName: "Root", kind: .agent, linkedAgentId: rootActorID.replacingOccurrences(of: "agent:", with: ""), channelId: rootActorID),
+            ActorNode(id: childActorID, displayName: "Child", kind: .agent, linkedAgentId: childActorID.replacingOccurrences(of: "agent:", with: ""), channelId: childActorID)
+        ],
+        links: [
+            ActorLink(
+                id: "dispatch-root",
+                sourceActorId: "human:dispatcher",
+                targetActorId: rootActorID,
+                direction: .oneWay,
+                relationship: .peer,
+                communicationType: .task
+            ),
+            ActorLink(
+                id: "root-child",
+                sourceActorId: rootActorID,
+                targetActorId: childActorID,
+                direction: .oneWay,
+                relationship: .hierarchical,
+                communicationType: .task
+            ),
+            ActorLink(
+                id: "child-root",
+                sourceActorId: childActorID,
+                targetActorId: rootActorID,
+                direction: .oneWay,
+                relationship: .hierarchical,
+                communicationType: .task
+            )
+        ],
+        teams: []
+    )
+    try await createProject(router: router, projectID: projectID, channelId: "general")
+
+    let taskID = try await createTask(
+        router: router,
+        projectID: projectID,
+        title: "Cycle root task",
+        status: "backlog",
+        actorId: rootActorID
+    )
+
+    let updateBody = try JSONEncoder().encode(ProjectTaskUpdateRequest(status: "ready"))
+    let updateResponse = await router.handle(
+        method: "PATCH",
+        path: "/v1/projects/\(projectID)/tasks/\(taskID)",
+        body: updateBody
+    )
+    #expect(updateResponse.status == 200)
+
+    let blockedProject = try await waitForProject(router: router, projectID: projectID, timeoutSeconds: 3) { project in
+        project.tasks.first(where: { $0.id == taskID })?.status == "blocked"
+    }
+    let blockedTask = blockedProject?.tasks.first(where: { $0.id == taskID })
+    #expect(blockedTask?.status == "blocked")
+}
+
+@Test
+func swarmPlannerFailureBlocksRootTask() async throws {
+    let workspaceName = "workspace-visor-swarm-planner-\(UUID().uuidString)"
+    let sqlitePath = FileManager.default.temporaryDirectory
+        .appendingPathComponent("core-visor-swarm-planner-\(UUID().uuidString).sqlite")
+        .path
+    var config = CoreConfig.default
+    config.workspace = .init(name: workspaceName, basePath: FileManager.default.temporaryDirectory.path)
+    config.sqlitePath = sqlitePath
+    let service = CoreService(config: config)
+    let router = CoreRouter(service: service)
+    let projectID = "visor-swarm-planner-\(UUID().uuidString)"
+    let rootActorID = "agent:root-\(UUID().uuidString)"
+    let childActorID = "agent:child-\(UUID().uuidString)"
+
+    try await createAgent(router: router, id: rootActorID.replacingOccurrences(of: "agent:", with: ""))
+    try await createAgent(router: router, id: childActorID.replacingOccurrences(of: "agent:", with: ""))
+    try await updateActorBoard(
+        router: router,
+        nodes: [
+            ActorNode(id: "human:dispatcher", displayName: "Dispatcher", kind: .human, channelId: "general"),
+            ActorNode(id: rootActorID, displayName: "Root", kind: .agent, linkedAgentId: rootActorID.replacingOccurrences(of: "agent:", with: ""), channelId: rootActorID),
+            ActorNode(id: childActorID, displayName: "Child", kind: .agent, linkedAgentId: childActorID.replacingOccurrences(of: "agent:", with: ""), channelId: childActorID)
+        ],
+        links: [
+            ActorLink(
+                id: "dispatch-root",
+                sourceActorId: "human:dispatcher",
+                targetActorId: rootActorID,
+                direction: .oneWay,
+                relationship: .peer,
+                communicationType: .task
+            ),
+            ActorLink(
+                id: "root-child",
+                sourceActorId: rootActorID,
+                targetActorId: childActorID,
+                direction: .oneWay,
+                relationship: .hierarchical,
+                communicationType: .task
+            )
+        ],
+        teams: []
+    )
+    try await createProject(router: router, projectID: projectID, channelId: "general")
+
+    let taskID = try await createTask(
+        router: router,
+        projectID: projectID,
+        title: "Planner root task",
+        status: "backlog",
+        actorId: rootActorID
+    )
+
+    let updateBody = try JSONEncoder().encode(ProjectTaskUpdateRequest(status: "ready"))
+    let updateResponse = await router.handle(
+        method: "PATCH",
+        path: "/v1/projects/\(projectID)/tasks/\(taskID)",
+        body: updateBody
+    )
+    #expect(updateResponse.status == 200)
+
+    let blockedProject = try await waitForProject(router: router, projectID: projectID, timeoutSeconds: 3) { project in
+        project.tasks.first(where: { $0.id == taskID })?.status == "blocked"
+    }
+    let blockedTask = blockedProject?.tasks.first(where: { $0.id == taskID })
+    #expect(blockedTask?.status == "blocked")
+}
+
+@Test
 func visorSkipsWhenProjectNotFoundForChannel() async throws {
     let router = try makeRouter()
 

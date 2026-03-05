@@ -40,6 +40,7 @@ public actor SQLiteStore: PersistenceStore {
 
         if sqlite3_open(path, &db) == SQLITE_OK {
             _ = sqlite3_exec(db, schemaSQL, nil, nil, nil)
+            Self.applyRuntimeEventMigrations(db: db)
             Self.applyProjectTaskMigrations(db: db)
             Self.applyChannelPluginMigrations(db: db)
         } else {
@@ -66,8 +67,9 @@ public actor SQLiteStore: PersistenceStore {
                 branch_id,
                 worker_id,
                 payload_json,
+                extensions_json,
                 created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
 
         var statement: OpaquePointer?
@@ -80,6 +82,8 @@ public actor SQLiteStore: PersistenceStore {
 
         let payloadData = try? JSONEncoder().encode(event.payload)
         let payloadString = payloadData.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let extensionsData = try? JSONEncoder().encode(event.extensions)
+        let extensionsString = extensionsData.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
 
         bindText(event.messageId, at: 1, statement: statement)
         bindText(event.messageType.rawValue, at: 2, statement: statement)
@@ -88,7 +92,8 @@ public actor SQLiteStore: PersistenceStore {
         bindOptionalText(event.branchId, at: 5, statement: statement)
         bindOptionalText(event.workerId, at: 6, statement: statement)
         bindText(payloadString, at: 7, statement: statement)
-        bindText(isoFormatter.string(from: event.ts), at: 8, statement: statement)
+        bindText(extensionsString, at: 8, statement: statement)
+        bindText(isoFormatter.string(from: event.ts), at: 9, statement: statement)
 
         if sqlite3_step(statement) != SQLITE_DONE {
             persistFallbackEvent(event)
@@ -675,9 +680,15 @@ public actor SQLiteStore: PersistenceStore {
                 team_id,
                 claimed_actor_id,
                 claimed_agent_id,
+                swarm_id,
+                swarm_task_id,
+                swarm_parent_task_id,
+                swarm_dependency_ids_json,
+                swarm_depth,
+                swarm_actor_path_json,
                 created_at,
                 updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
 
         for task in project.tasks {
@@ -686,6 +697,8 @@ public actor SQLiteStore: PersistenceStore {
                 continue
             }
             defer { sqlite3_finalize(taskStatement) }
+            let dependencyIdsJSON = encodedStringArray(task.swarmDependencyIds ?? [])
+            let actorPathJSON = encodedStringArray(task.swarmActorPath ?? [])
             bindText(task.id, at: 1, statement: taskStatement)
             bindText(project.id, at: 2, statement: taskStatement)
             bindText(task.title, at: 3, statement: taskStatement)
@@ -696,8 +709,18 @@ public actor SQLiteStore: PersistenceStore {
             bindOptionalText(task.teamId, at: 8, statement: taskStatement)
             bindOptionalText(task.claimedActorId, at: 9, statement: taskStatement)
             bindOptionalText(task.claimedAgentId, at: 10, statement: taskStatement)
-            bindText(isoFormatter.string(from: task.createdAt), at: 11, statement: taskStatement)
-            bindText(isoFormatter.string(from: task.updatedAt), at: 12, statement: taskStatement)
+            bindOptionalText(task.swarmId, at: 11, statement: taskStatement)
+            bindOptionalText(task.swarmTaskId, at: 12, statement: taskStatement)
+            bindOptionalText(task.swarmParentTaskId, at: 13, statement: taskStatement)
+            bindText(dependencyIdsJSON, at: 14, statement: taskStatement)
+            if let swarmDepth = task.swarmDepth {
+                sqlite3_bind_int(taskStatement, 15, Int32(swarmDepth))
+            } else {
+                sqlite3_bind_null(taskStatement, 15)
+            }
+            bindText(actorPathJSON, at: 16, statement: taskStatement)
+            bindText(isoFormatter.string(from: task.createdAt), at: 17, statement: taskStatement)
+            bindText(isoFormatter.string(from: task.updatedAt), at: 18, statement: taskStatement)
             _ = sqlite3_step(taskStatement)
         }
 #endif
@@ -1089,6 +1112,12 @@ public actor SQLiteStore: PersistenceStore {
                 team_id,
                 claimed_actor_id,
                 claimed_agent_id,
+                swarm_id,
+                swarm_task_id,
+                swarm_parent_task_id,
+                swarm_dependency_ids_json,
+                swarm_depth,
+                swarm_actor_path_json,
                 created_at,
                 updated_at
             FROM dashboard_project_tasks
@@ -1111,13 +1140,15 @@ public actor SQLiteStore: PersistenceStore {
                 let descriptionPtr = sqlite3_column_text(statement, 2),
                 let priorityPtr = sqlite3_column_text(statement, 3),
                 let statusPtr = sqlite3_column_text(statement, 4),
-                let createdAtPtr = sqlite3_column_text(statement, 9),
-                let updatedAtPtr = sqlite3_column_text(statement, 10)
+                let createdAtPtr = sqlite3_column_text(statement, 15),
+                let updatedAtPtr = sqlite3_column_text(statement, 16)
             else {
                 continue
             }
             let createdAt = isoFormatter.date(from: String(cString: createdAtPtr)) ?? Date()
             let updatedAt = isoFormatter.date(from: String(cString: updatedAtPtr)) ?? createdAt
+            let dependencyIds = decodeOptionalStringArray(optionalText(statement: statement, index: 12))
+            let actorPath = decodeOptionalStringArray(optionalText(statement: statement, index: 14))
             result.append(
                 ProjectTask(
                     id: String(cString: idPtr),
@@ -1129,6 +1160,12 @@ public actor SQLiteStore: PersistenceStore {
                     teamId: optionalText(statement: statement, index: 6),
                     claimedActorId: optionalText(statement: statement, index: 7),
                     claimedAgentId: optionalText(statement: statement, index: 8),
+                    swarmId: optionalText(statement: statement, index: 9),
+                    swarmTaskId: optionalText(statement: statement, index: 10),
+                    swarmParentTaskId: optionalText(statement: statement, index: 11),
+                    swarmDependencyIds: dependencyIds,
+                    swarmDepth: optionalInt(statement: statement, index: 13),
+                    swarmActorPath: actorPath,
                     createdAt: createdAt,
                     updatedAt: updatedAt
                 )
@@ -1141,7 +1178,7 @@ public actor SQLiteStore: PersistenceStore {
     private func loadPersistedEvents(db: OpaquePointer) -> [EventEnvelope] {
         let sql =
             """
-            SELECT id, message_type, channel_id, task_id, branch_id, worker_id, payload_json, created_at
+            SELECT id, message_type, channel_id, task_id, branch_id, worker_id, payload_json, extensions_json, created_at
             FROM events
             ORDER BY created_at ASC, id ASC;
             """
@@ -1158,7 +1195,8 @@ public actor SQLiteStore: PersistenceStore {
                 let messageTypePtr = sqlite3_column_text(statement, 1),
                 let channelIDPtr = sqlite3_column_text(statement, 2),
                 let payloadPtr = sqlite3_column_text(statement, 6),
-                let createdAtPtr = sqlite3_column_text(statement, 7)
+                let extensionsPtr = sqlite3_column_text(statement, 7),
+                let createdAtPtr = sqlite3_column_text(statement, 8)
             else {
                 continue
             }
@@ -1173,6 +1211,9 @@ public actor SQLiteStore: PersistenceStore {
             let payloadJSON = String(cString: payloadPtr)
             let payloadData = Data(payloadJSON.utf8)
             let payload = (try? JSONDecoder().decode(JSONValue.self, from: payloadData)) ?? .object([:])
+            let extensionsJSON = String(cString: extensionsPtr)
+            let extensionsData = Data(extensionsJSON.utf8)
+            let extensions = (try? JSONDecoder().decode([String: JSONValue].self, from: extensionsData)) ?? [:]
 
             result.append(
                 EventEnvelope(
@@ -1184,7 +1225,8 @@ public actor SQLiteStore: PersistenceStore {
                     taskId: optionalText(statement: statement, index: 3),
                     branchId: optionalText(statement: statement, index: 4),
                     workerId: optionalText(statement: statement, index: 5),
-                    payload: payload
+                    payload: payload,
+                    extensions: extensions
                 )
             )
         }
@@ -1214,7 +1256,7 @@ public actor SQLiteStore: PersistenceStore {
         let whereClause = "WHERE " + conditions.joined(separator: " AND ")
         let sql =
             """
-            SELECT id, message_type, channel_id, task_id, branch_id, worker_id, payload_json, created_at
+            SELECT id, message_type, channel_id, task_id, branch_id, worker_id, payload_json, extensions_json, created_at
             FROM events
             \(whereClause)
             ORDER BY created_at DESC, id DESC
@@ -1259,7 +1301,8 @@ public actor SQLiteStore: PersistenceStore {
                 let messageTypePtr = sqlite3_column_text(statement, 1),
                 let channelIDPtr = sqlite3_column_text(statement, 2),
                 let payloadPtr = sqlite3_column_text(statement, 6),
-                let createdAtPtr = sqlite3_column_text(statement, 7)
+                let extensionsPtr = sqlite3_column_text(statement, 7),
+                let createdAtPtr = sqlite3_column_text(statement, 8)
             else {
                 continue
             }
@@ -1274,6 +1317,9 @@ public actor SQLiteStore: PersistenceStore {
             let payloadJSON = String(cString: payloadPtr)
             let payloadData = Data(payloadJSON.utf8)
             let payload = (try? JSONDecoder().decode(JSONValue.self, from: payloadData)) ?? .object([:])
+            let extensionsJSON = String(cString: extensionsPtr)
+            let extensionsData = Data(extensionsJSON.utf8)
+            let extensions = (try? JSONDecoder().decode([String: JSONValue].self, from: extensionsData)) ?? [:]
 
             result.append(
                 EventEnvelope(
@@ -1285,7 +1331,8 @@ public actor SQLiteStore: PersistenceStore {
                     taskId: optionalText(statement: statement, index: 3),
                     branchId: optionalText(statement: statement, index: 4),
                     workerId: optionalText(statement: statement, index: 5),
-                    payload: payload
+                    payload: payload,
+                    extensions: extensions
                 )
             )
         }
@@ -1546,6 +1593,13 @@ public actor SQLiteStore: PersistenceStore {
         return String(cString: text)
     }
 
+    private func optionalInt(statement: OpaquePointer?, index: Int32) -> Int? {
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else {
+            return nil
+        }
+        return Int(sqlite3_column_int(statement, index))
+    }
+
     private static func applyProjectTaskMigrations(db: OpaquePointer?) {
         guard let db else {
             return
@@ -1555,12 +1609,29 @@ public actor SQLiteStore: PersistenceStore {
             "ALTER TABLE dashboard_project_tasks ADD COLUMN actor_id TEXT;",
             "ALTER TABLE dashboard_project_tasks ADD COLUMN team_id TEXT;",
             "ALTER TABLE dashboard_project_tasks ADD COLUMN claimed_actor_id TEXT;",
-            "ALTER TABLE dashboard_project_tasks ADD COLUMN claimed_agent_id TEXT;"
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN claimed_agent_id TEXT;",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_id TEXT;",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_task_id TEXT;",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_parent_task_id TEXT;",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_dependency_ids_json TEXT NOT NULL DEFAULT '[]';",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_depth INTEGER;",
+            "ALTER TABLE dashboard_project_tasks ADD COLUMN swarm_actor_path_json TEXT NOT NULL DEFAULT '[]';"
         ]
 
         for statement in statements {
             _ = sqlite3_exec(db, statement, nil, nil, nil)
         }
+    }
+
+    private static func applyRuntimeEventMigrations(db: OpaquePointer?) {
+        guard let db else {
+            return
+        }
+        _ = sqlite3_exec(
+            db,
+            "ALTER TABLE events ADD COLUMN extensions_json TEXT NOT NULL DEFAULT '{}';",
+            nil, nil, nil
+        )
     }
 
     private static func applyChannelPluginMigrations(db: OpaquePointer?) {
@@ -1626,6 +1697,23 @@ public actor SQLiteStore: PersistenceStore {
             createdAt: createdAt,
             updatedAt: updatedAt
         )
+    }
+
+    private func encodedStringArray(_ values: [String]) -> String {
+        let encoded = (try? JSONEncoder().encode(values)) ?? Data("[]".utf8)
+        return String(data: encoded, encoding: .utf8) ?? "[]"
+    }
+
+    private func decodeOptionalStringArray(_ raw: String?) -> [String]? {
+        guard let raw, !raw.isEmpty else {
+            return nil
+        }
+        guard let data = raw.data(using: .utf8),
+              let values = try? JSONDecoder().decode([String].self, from: data)
+        else {
+            return nil
+        }
+        return values.isEmpty ? nil : values
     }
 #endif
 }

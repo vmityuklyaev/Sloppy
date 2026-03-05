@@ -28,6 +28,7 @@ const TASK_STATUSES = [
   { id: "backlog", title: "Backlog" },
   { id: "ready", title: "Ready to work" },
   { id: "in_progress", title: "In progress" },
+  { id: "blocked", title: "Blocked" },
   { id: "done", title: "Done" }
 ];
 
@@ -88,6 +89,16 @@ function normalizeTask(task, index = 0) {
     teamId: String(task?.teamId || "").trim(),
     claimedActorId: String(task?.claimedActorId || "").trim(),
     claimedAgentId: String(task?.claimedAgentId || "").trim(),
+    swarmId: String(task?.swarmId || "").trim(),
+    swarmTaskId: String(task?.swarmTaskId || "").trim(),
+    swarmParentTaskId: String(task?.swarmParentTaskId || "").trim(),
+    swarmDependencyIds: Array.isArray(task?.swarmDependencyIds)
+      ? task.swarmDependencyIds.map((id) => String(id).trim()).filter(Boolean)
+      : [],
+    swarmDepth: Number.isFinite(Number(task?.swarmDepth)) ? Number(task.swarmDepth) : null,
+    swarmActorPath: Array.isArray(task?.swarmActorPath)
+      ? task.swarmActorPath.map((id) => String(id).trim()).filter(Boolean)
+      : [],
     createdAt: String(task?.createdAt || new Date().toISOString()),
     updatedAt: String(task?.updatedAt || task?.createdAt || new Date().toISOString())
   };
@@ -149,6 +160,63 @@ function buildTaskCounts(tasks) {
     counts[status.id] = tasks.filter((task) => task.status === status.id).length;
   }
   return counts;
+}
+
+function buildSwarmGroups(tasks) {
+  const bySwarmId = new Map();
+  for (const task of tasks) {
+    if (!task.swarmId) {
+      continue;
+    }
+    if (!bySwarmId.has(task.swarmId)) {
+      bySwarmId.set(task.swarmId, []);
+    }
+    bySwarmId.get(task.swarmId).push(task);
+  }
+
+  return Array.from(bySwarmId.entries())
+    .sort((left, right) => left[0].localeCompare(right[0]))
+    .map(([swarmId, swarmTasks]) => {
+      const taskBySwarmTaskId = new Map();
+      for (const task of swarmTasks) {
+        if (task.swarmTaskId) {
+          taskBySwarmTaskId.set(task.swarmTaskId, task);
+        }
+      }
+
+      const childrenByParent = new Map();
+      for (const task of swarmTasks) {
+        if (task.swarmTaskId === "root") {
+          continue;
+        }
+        const parentKey = task.swarmParentTaskId && taskBySwarmTaskId.has(task.swarmParentTaskId)
+          ? task.swarmParentTaskId
+          : "root";
+        if (!childrenByParent.has(parentKey)) {
+          childrenByParent.set(parentKey, []);
+        }
+        childrenByParent.get(parentKey).push(task);
+      }
+
+      for (const [parentKey, children] of childrenByParent.entries()) {
+        childrenByParent.set(parentKey, [...children].sort((left, right) => {
+          if ((left.swarmDepth ?? 0) !== (right.swarmDepth ?? 0)) {
+            return (left.swarmDepth ?? 0) - (right.swarmDepth ?? 0);
+          }
+          return new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime();
+        }));
+      }
+
+      const rootTask = swarmTasks.find((task) => task.swarmTaskId === "root") || null;
+      const roots = rootTask ? [rootTask] : (childrenByParent.get("root") || []);
+
+      return {
+        swarmId,
+        tasks: swarmTasks,
+        roots,
+        childrenByParent
+      };
+    });
 }
 
 function formatRelativeTime(dateValue) {
@@ -1623,6 +1691,38 @@ export function ProjectsView({
 
   function renderTasksTab(project) {
     const taskCounts = buildTaskCounts(project.tasks);
+    const swarmGroups = buildSwarmGroups(project.tasks);
+
+    const renderSwarmNode = (task, group, level = 0, visited = new Set()) => {
+      const taskKey = task.swarmTaskId || `task:${task.id}`;
+      if (visited.has(taskKey)) {
+        return null;
+      }
+      const nextVisited = new Set(visited);
+      nextVisited.add(taskKey);
+
+      const children = group.childrenByParent.get(taskKey) || [];
+      return (
+        <div key={task.id} className="project-swarm-node" style={{ marginLeft: `${Math.min(level, 8) * 16}px` }}>
+          <button
+            type="button"
+            className="project-swarm-node-main"
+            onClick={() => openEditTaskModal(task)}
+            title={`Open task ${task.id}`}
+          >
+            <span className={`project-swarm-status project-swarm-status--${task.status}`}>{task.status}</span>
+            <span className="project-swarm-node-title">{task.title}</span>
+            {Number.isFinite(task.swarmDepth) ? <span className="project-swarm-node-meta">Depth {task.swarmDepth}</span> : null}
+            {task.swarmTaskId ? <span className="project-swarm-node-meta">{task.swarmTaskId}</span> : null}
+          </button>
+          {children.length > 0 ? (
+            <div className="project-swarm-node-children">
+              {children.map((child) => renderSwarmNode(child, group, level + 1, nextVisited))}
+            </div>
+          ) : null}
+        </div>
+      );
+    };
 
     return (
       <section className="project-tab-layout">
@@ -1637,9 +1737,52 @@ export function ProjectsView({
             </button>
           </div>
 
+          {swarmGroups.length > 0 ? (
+            <section className="project-swarm-overview">
+              <div className="project-pane-head">
+                <h4>Swarm Tree</h4>
+              </div>
+              <div className="project-swarm-list">
+                {swarmGroups.map((group) => {
+                  const counts = buildTaskCounts(group.tasks);
+                  return (
+                    <article key={group.swarmId} className="project-swarm-card">
+                      <header className="project-swarm-card-head">
+                        <strong>{group.swarmId}</strong>
+                        <span>{counts.total} tasks</span>
+                        <span>{counts.blocked || 0} blocked</span>
+                      </header>
+                      <div className="project-swarm-tree">
+                        {group.roots.length === 0 ? (
+                          <p className="placeholder-text">No root nodes detected.</p>
+                        ) : (
+                          group.roots.map((rootNode) => renderSwarmNode(rootNode, group))
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+
           <div className="project-kanban-board">
             {TASK_STATUSES.map((column) => {
-              const tasks = sortTasksByDate(project.tasks.filter((task) => task.status === column.id));
+              const tasks = sortTasksByDate(project.tasks.filter((task) => task.status === column.id)).sort((left, right) => {
+                if (left.swarmId && right.swarmId && left.swarmId !== right.swarmId) {
+                  return left.swarmId.localeCompare(right.swarmId);
+                }
+                if (left.swarmId && !right.swarmId) {
+                  return -1;
+                }
+                if (!left.swarmId && right.swarmId) {
+                  return 1;
+                }
+                if ((left.swarmDepth ?? 0) !== (right.swarmDepth ?? 0)) {
+                  return (left.swarmDepth ?? 0) - (right.swarmDepth ?? 0);
+                }
+                return new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime();
+              });
 
               return (
                 <section
@@ -1663,65 +1806,82 @@ export function ProjectsView({
                     {tasks.length === 0 ? (
                       <p className="placeholder-text">No tasks</p>
                     ) : (
-                      tasks.map((task) => (
-                        <article
-                          key={task.id}
-                          className="project-kanban-task project-kanban-task--clickable"
-                          role="button"
-                          tabIndex={0}
-                          draggable
-                          onClick={() => openEditTaskModal(task)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.preventDefault();
-                              openEditTaskModal(task);
-                            }
-                          }}
-                          onDragStart={(event) => {
-                            event.dataTransfer.setData("text/project-task-id", task.id);
-                            event.dataTransfer.effectAllowed = "move";
-                          }}
-                        >
-                          <h5>{task.title}</h5>
-                          {task.description ? <p>{task.description}</p> : null}
-
-                          <div className="project-task-meta">
-                            <span className={`project-priority-badge ${task.priority}`}>
-                              {TASK_PRIORITY_LABELS[task.priority] || "Medium"}
-                            </span>
-                            {task.claimedAgentId ? (
-                              <span className="project-task-claim-badge">Agent: {task.claimedAgentId}</span>
+                      tasks.map((task, index) => {
+                        const previous = index > 0 ? tasks[index - 1] : null;
+                        const showSwarmHeader = task.swarmId && (!previous || previous.swarmId !== task.swarmId);
+                        return (
+                          <React.Fragment key={task.id}>
+                            {showSwarmHeader ? (
+                              <p className="project-task-assignee-badge">Swarm: {task.swarmId}</p>
                             ) : null}
-                            {!task.claimedAgentId && task.claimedActorId ? (
-                              <span className="project-task-claim-badge">Actor: {task.claimedActorId}</span>
-                            ) : null}
-                            {!task.claimedAgentId && !task.claimedActorId && task.actorId ? (
-                              <span className="project-task-assignee-badge">Assigned actor: {task.actorId}</span>
-                            ) : null}
-                            {!task.claimedAgentId && !task.claimedActorId && !task.actorId && task.teamId ? (
-                              <span className="project-task-assignee-badge">Assigned team: {task.teamId}</span>
-                            ) : null}
-                            <span className="project-task-age">{formatRelativeTime(task.createdAt)}</span>
-                          </div>
-
-                          <div className="project-task-actions" onClick={(e) => e.stopPropagation()}>
-                            <select
-                              value={task.status}
-                              onChange={(event) => moveTask(task.id, String(event.target.value))}
-                              aria-label="Task status"
+                            <article
+                              className="project-kanban-task project-kanban-task--clickable"
+                              role="button"
+                              tabIndex={0}
+                              draggable
+                              onClick={() => openEditTaskModal(task)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  openEditTaskModal(task);
+                                }
+                              }}
+                              onDragStart={(event) => {
+                                event.dataTransfer.setData("text/project-task-id", task.id);
+                                event.dataTransfer.effectAllowed = "move";
+                              }}
                             >
-                              {TASK_STATUSES.map((status) => (
-                                <option key={status.id} value={status.id}>
-                                  {status.title}
-                                </option>
-                              ))}
-                            </select>
-                            <button type="button" className="danger" onClick={() => deleteTask(task.id)}>
-                              Delete
-                            </button>
-                          </div>
-                        </article>
-                      ))
+                              <h5>{task.title}</h5>
+                              {task.description ? <p>{task.description}</p> : null}
+
+                              <div className="project-task-meta">
+                                <span className={`project-priority-badge ${task.priority}`}>
+                                  {TASK_PRIORITY_LABELS[task.priority] || "Medium"}
+                                </span>
+                                {task.swarmTaskId ? <span className="project-task-claim-badge">Swarm task: {task.swarmTaskId}</span> : null}
+                                {Number.isFinite(task.swarmDepth) ? <span className="project-task-assignee-badge">Depth: {task.swarmDepth}</span> : null}
+                                {task.swarmParentTaskId ? <span className="project-task-assignee-badge">Parent: {task.swarmParentTaskId}</span> : null}
+                                {task.swarmDependencyIds.length > 0 ? (
+                                  <span className="project-task-assignee-badge">Deps: {task.swarmDependencyIds.join(", ")}</span>
+                                ) : null}
+                                {task.swarmActorPath.length > 0 ? (
+                                  <span className="project-task-assignee-badge">Path: {task.swarmActorPath.join(" -> ")}</span>
+                                ) : null}
+                                {task.claimedAgentId ? (
+                                  <span className="project-task-claim-badge">Agent: {task.claimedAgentId}</span>
+                                ) : null}
+                                {!task.claimedAgentId && task.claimedActorId ? (
+                                  <span className="project-task-claim-badge">Actor: {task.claimedActorId}</span>
+                                ) : null}
+                                {!task.claimedAgentId && !task.claimedActorId && task.actorId ? (
+                                  <span className="project-task-assignee-badge">Assigned actor: {task.actorId}</span>
+                                ) : null}
+                                {!task.claimedAgentId && !task.claimedActorId && !task.actorId && task.teamId ? (
+                                  <span className="project-task-assignee-badge">Assigned team: {task.teamId}</span>
+                                ) : null}
+                                <span className="project-task-age">{formatRelativeTime(task.createdAt)}</span>
+                              </div>
+
+                              <div className="project-task-actions" onClick={(e) => e.stopPropagation()}>
+                                <select
+                                  value={task.status}
+                                  onChange={(event) => moveTask(task.id, String(event.target.value))}
+                                  aria-label="Task status"
+                                >
+                                  {TASK_STATUSES.map((status) => (
+                                    <option key={status.id} value={status.id}>
+                                      {status.title}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button type="button" className="danger" onClick={() => deleteTask(task.id)}>
+                                  Delete
+                                </button>
+                              </div>
+                            </article>
+                          </React.Fragment>
+                        );
+                      })
                     )}
                   </div>
                 </section>

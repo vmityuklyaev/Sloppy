@@ -136,6 +136,7 @@ public actor CoreService {
     private let agentSkillsStore: AgentSkillsFileStore
     private let skillsRegistryService: SkillsRegistryService
     private let skillsGitHubClient: SkillsGitHubClient
+    private let swarmPlanner: SwarmPlanner
     private let logger: Logger
     private let configPath: String
     private var workspaceRootURL: URL
@@ -154,10 +155,11 @@ public actor CoreService {
     ) {
         let resolvedModels = CoreModelProviderFactory.resolveModelIdentifiers(config: config)
         let modelProvider = CoreModelProviderFactory.buildModelProvider(config: config, resolvedModels: resolvedModels)
-        self.runtime = RuntimeSystem(
+        let runtime = RuntimeSystem(
             modelProvider: modelProvider,
             defaultModel: modelProvider?.models.first ?? resolvedModels.first
         )
+        self.runtime = runtime
         self.store = persistenceBuilder.makeStore(config: config)
         self.openAIProviderCatalog = OpenAIProviderCatalogService()
         self.configPath = configPath
@@ -174,6 +176,9 @@ public actor CoreService {
         self.agentSkillsStore = AgentSkillsFileStore(agentsRootURL: self.agentsRootURL)
         self.skillsRegistryService = SkillsRegistryService()
         self.skillsGitHubClient = SkillsGitHubClient()
+        self.swarmPlanner = SwarmPlanner { prompt, maxTokens in
+            await runtime.complete(prompt: prompt, maxTokens: maxTokens)
+        }
         let orchestratorCatalogStore = AgentCatalogFileStore(agentsRootURL: self.agentsRootURL)
         let orchestratorSessionStore = AgentSessionFileStore(agentsRootURL: self.agentsRootURL)
         self.sessionOrchestrator = AgentSessionOrchestrator(
@@ -1959,7 +1964,13 @@ public actor CoreService {
             return
         }
 
-        guard let delegation = await resolveTaskDelegation(project: project, task: task) else {
+        let delegation: TaskDelegation?
+        if task.swarmId != nil, let swarmTaskId = task.swarmTaskId, swarmTaskId != "root" {
+            delegation = await resolveSwarmTaskDelegation(project: project, task: task)
+        } else {
+            delegation = await resolveTaskDelegation(project: project, task: task)
+        }
+        guard let delegation else {
             let blockedMessage = "Task \(task.id) is ready but no eligible actor route was resolved."
             if let channelID = resolveExecutionChannelID(project: project, task: task) {
                 await runtime.appendSystemMessage(channelId: channelID, content: blockedMessage)
@@ -1972,6 +1983,10 @@ public actor CoreService {
                 workerID: nil,
                 message: blockedMessage
             )
+            return
+        }
+
+        if await startSwarmIfHierarchical(projectID: project.id, taskID: task.id, delegation: delegation) {
             return
         }
 
@@ -2053,6 +2068,566 @@ public actor CoreService {
         let channelID: String
     }
 
+    private func startSwarmIfHierarchical(
+        projectID: String,
+        taskID: String,
+        delegation: TaskDelegation
+    ) async -> Bool {
+        guard var project = await store.project(id: projectID),
+              let taskIndex = project.tasks.firstIndex(where: { $0.id == taskID })
+        else {
+            return false
+        }
+
+        var rootTask = project.tasks[taskIndex]
+        guard rootTask.status == "ready" else {
+            return false
+        }
+        guard rootTask.swarmTaskId == nil else {
+            return false
+        }
+        let hasExplicitAssignee = (rootTask.actorId != nil || rootTask.teamId != nil || rootTask.claimedActorId != nil)
+        guard hasExplicitAssignee else {
+            return false
+        }
+
+        guard let board = try? getActorBoard() else {
+            return false
+        }
+        let rootActorID = delegation.actorID ?? rootTask.claimedActorId ?? rootTask.actorId ?? ""
+        guard !rootActorID.isEmpty else {
+            return false
+        }
+
+        switch SwarmCoordinator.buildHierarchy(rootActorId: rootActorID, links: board.links, logger: logger) {
+        case .noHierarchy:
+            return false
+        case .cycle:
+            await failSwarmRootWithEscalation(
+                projectID: projectID,
+                rootTaskID: rootTask.id,
+                failedTaskID: nil,
+                reason: "Swarm hierarchy cycle detected; execution was blocked.",
+                executionChannelID: delegation.channelID,
+                board: board
+            )
+            return true
+        case .hierarchy(let hierarchy):
+            do {
+                let plannedSubtasks = try await swarmPlanner.plan(rootTask: rootTask, actorLevels: hierarchy.levels)
+                if plannedSubtasks.isEmpty {
+                    await failSwarmRootWithEscalation(
+                        projectID: projectID,
+                        rootTaskID: rootTask.id,
+                        failedTaskID: nil,
+                        reason: "Swarm planner returned empty subtask plan.",
+                        executionChannelID: delegation.channelID,
+                        board: board
+                    )
+                    return true
+                }
+
+                let swarmID = UUID().uuidString
+                rootTask.claimedActorId = delegation.actorID
+                rootTask.claimedAgentId = delegation.agentID
+                if let actorID = delegation.actorID {
+                    rootTask.actorId = actorID
+                }
+                rootTask.swarmId = swarmID
+                rootTask.swarmTaskId = "root"
+                rootTask.swarmParentTaskId = nil
+                rootTask.swarmDependencyIds = nil
+                rootTask.swarmDepth = 0
+                rootTask.swarmActorPath = [rootActorID]
+                rootTask.status = "in_progress"
+                rootTask.updatedAt = Date()
+                project.tasks[taskIndex] = rootTask
+
+                var roundRobinByDepth: [Int: Int] = [:]
+                let sortedPlanned = plannedSubtasks.sorted { lhs, rhs in
+                    if lhs.depth == rhs.depth {
+                        return lhs.swarmTaskId < rhs.swarmTaskId
+                    }
+                    return lhs.depth < rhs.depth
+                }
+
+                for planned in sortedPlanned {
+                    guard !hierarchy.levels.isEmpty else { continue }
+                    let levelIndex = min(max(planned.depth, 1) - 1, hierarchy.levels.count - 1)
+                    let levelActors = hierarchy.levels[levelIndex]
+                    guard !levelActors.isEmpty else { continue }
+
+                    let nextIndex = roundRobinByDepth[levelIndex, default: 0]
+                    let assignedActorID = levelActors[nextIndex % levelActors.count]
+                    roundRobinByDepth[levelIndex] = nextIndex + 1
+                    let actorPath = swarmActorPath(
+                        rootActorID: hierarchy.rootActorId,
+                        targetActorID: assignedActorID,
+                        parentByActor: hierarchy.parentByActor
+                    )
+
+                    let now = Date()
+                    project.tasks.append(
+                        ProjectTask(
+                            id: UUID().uuidString,
+                            title: planned.title,
+                            description: normalizeTaskDescription(
+                                """
+                                Source: swarm-planner
+                                Swarm objective: \(planned.objective)
+                                """
+                            ),
+                            priority: rootTask.priority,
+                            status: "ready",
+                            actorId: assignedActorID,
+                            teamId: nil,
+                            claimedActorId: nil,
+                            claimedAgentId: nil,
+                            swarmId: swarmID,
+                            swarmTaskId: planned.swarmTaskId,
+                            swarmParentTaskId: planned.dependencyIds.first,
+                            swarmDependencyIds: planned.dependencyIds,
+                            swarmDepth: planned.depth,
+                            swarmActorPath: actorPath,
+                            createdAt: now,
+                            updatedAt: now
+                        )
+                    )
+                }
+
+                project.updatedAt = Date()
+                await store.saveProject(project)
+                appendTaskLifecycleLog(
+                    projectID: project.id,
+                    taskID: rootTask.id,
+                    stage: "swarm_started",
+                    channelID: delegation.channelID,
+                    workerID: nil,
+                    message: "Swarm started with \(project.tasks.filter { $0.swarmId == swarmID && $0.id != rootTask.id }.count) subtasks.",
+                    actorID: delegation.actorID,
+                    agentID: delegation.agentID
+                )
+                await runtime.appendSystemMessage(
+                    channelId: delegation.channelID,
+                    content: "Swarm \(swarmID) started for task \(rootTask.id)."
+                )
+
+                Task {
+                    await self.executeSwarm(
+                        projectID: projectID,
+                        rootTaskID: rootTask.id,
+                        swarmID: swarmID,
+                        executionChannelID: delegation.channelID,
+                        board: board
+                    )
+                }
+                return true
+            } catch {
+                await failSwarmRootWithEscalation(
+                    projectID: projectID,
+                    rootTaskID: rootTask.id,
+                    failedTaskID: nil,
+                    reason: "Swarm planner failed: \(error)",
+                    executionChannelID: delegation.channelID,
+                    board: board
+                )
+                return true
+            }
+        }
+    }
+
+    private func executeSwarm(
+        projectID: String,
+        rootTaskID: String,
+        swarmID: String,
+        executionChannelID: String,
+        board: ActorBoardSnapshot
+    ) async {
+        guard let project = await store.project(id: projectID) else {
+            return
+        }
+        let swarmTasks = project.tasks
+            .filter { $0.swarmId == swarmID && $0.id != rootTaskID }
+            .sorted { lhs, rhs in
+                if lhs.swarmDepth == rhs.swarmDepth {
+                    return lhs.createdAt < rhs.createdAt
+                }
+                return (lhs.swarmDepth ?? .max) < (rhs.swarmDepth ?? .max)
+            }
+
+        if swarmTasks.isEmpty {
+            await failSwarmRootWithEscalation(
+                projectID: projectID,
+                rootTaskID: rootTaskID,
+                failedTaskID: nil,
+                reason: "Swarm has no executable child tasks.",
+                executionChannelID: executionChannelID,
+                board: board
+            )
+            return
+        }
+
+        var completedSwarmTaskIDs: Set<String> = []
+        let byDepth = Dictionary(grouping: swarmTasks, by: { $0.swarmDepth ?? 1 })
+        let orderedDepths = byDepth.keys.sorted()
+
+        for depth in orderedDepths {
+            let levelTasks = (byDepth[depth] ?? []).sorted { $0.createdAt < $1.createdAt }
+            var pendingTasks = levelTasks.filter { task in
+                let dependencies = Set(task.swarmDependencyIds ?? [])
+                return dependencies.isSubset(of: completedSwarmTaskIDs)
+            }
+            if pendingTasks.count != levelTasks.count {
+                await failSwarmRootWithEscalation(
+                    projectID: projectID,
+                    rootTaskID: rootTaskID,
+                    failedTaskID: nil,
+                    reason: "Swarm dependencies are unresolved at level \(depth).",
+                    executionChannelID: executionChannelID,
+                    board: board
+                )
+                return
+            }
+
+            while !pendingTasks.isEmpty {
+                let batch = Array(pendingTasks.prefix(3))
+                pendingTasks.removeFirst(min(3, pendingTasks.count))
+
+                for task in batch {
+                    await handleTaskBecameReady(projectID: projectID, taskID: task.id)
+                }
+
+                let settled = await waitForTasksToSettle(
+                    projectID: projectID,
+                    taskIDs: batch.map(\.id),
+                    timeoutSeconds: 240
+                )
+                guard settled else {
+                    await failSwarmRootWithEscalation(
+                        projectID: projectID,
+                        rootTaskID: rootTaskID,
+                        failedTaskID: batch.first?.id,
+                        reason: "Swarm batch timed out while waiting for worker completion.",
+                        executionChannelID: executionChannelID,
+                        board: board
+                    )
+                    return
+                }
+
+                guard let refreshedProject = await store.project(id: projectID) else {
+                    return
+                }
+                for task in batch {
+                    guard let refreshed = refreshedProject.tasks.first(where: { $0.id == task.id }) else {
+                        continue
+                    }
+                    if refreshed.status != "done" {
+                        await failSwarmRootWithEscalation(
+                            projectID: projectID,
+                            rootTaskID: rootTaskID,
+                            failedTaskID: refreshed.id,
+                            reason: "Child task \(refreshed.id) finished with status \(refreshed.status).",
+                            executionChannelID: executionChannelID,
+                            board: board
+                        )
+                        return
+                    }
+                    if let swarmTaskId = refreshed.swarmTaskId {
+                        completedSwarmTaskIDs.insert(swarmTaskId)
+                    }
+                }
+            }
+        }
+
+        await completeSwarmRoot(
+            projectID: projectID,
+            rootTaskID: rootTaskID,
+            swarmID: swarmID,
+            executionChannelID: executionChannelID
+        )
+    }
+
+    private func waitForTasksToSettle(
+        projectID: String,
+        taskIDs: [String],
+        timeoutSeconds: TimeInterval
+    ) async -> Bool {
+        let runningStatuses = Set(["in_progress"])
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+
+        while Date() < deadline {
+            guard let project = await store.project(id: projectID) else {
+                return false
+            }
+
+            let statuses: [String] = taskIDs.compactMap { taskID in
+                project.tasks.first(where: { $0.id == taskID })?.status
+            }
+            guard statuses.count == taskIDs.count else {
+                return false
+            }
+            if statuses.allSatisfy({ !runningStatuses.contains($0) }) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        return false
+    }
+
+    private func completeSwarmRoot(
+        projectID: String,
+        rootTaskID: String,
+        swarmID: String,
+        executionChannelID: String
+    ) async {
+        guard var project = await store.project(id: projectID),
+              let rootIndex = project.tasks.firstIndex(where: { $0.id == rootTaskID })
+        else {
+            return
+        }
+
+        let childTasks = project.tasks.filter { $0.swarmId == swarmID && $0.id != rootTaskID }
+        let artifactRefs = childTasks.flatMap { task in
+            extractArtifactRefs(from: task.description)
+        }
+        let summaryLine = "Swarm completed \(childTasks.count) subtasks."
+        let artifactLine = artifactRefs.isEmpty ? "" : "\nArtifacts: \(artifactRefs.joined(separator: ", "))"
+
+        var rootTask = project.tasks[rootIndex]
+        rootTask.status = "done"
+        rootTask.updatedAt = Date()
+        if !summaryLine.isEmpty {
+            if rootTask.description.isEmpty {
+                rootTask.description = summaryLine + artifactLine
+            } else if !rootTask.description.contains(summaryLine) {
+                rootTask.description += "\n\n" + summaryLine + artifactLine
+            }
+        }
+        project.tasks[rootIndex] = rootTask
+        project.updatedAt = Date()
+        await store.saveProject(project)
+
+        appendTaskLifecycleLog(
+            projectID: projectID,
+            taskID: rootTaskID,
+            stage: "swarm_completed",
+            channelID: executionChannelID,
+            workerID: nil,
+            message: summaryLine
+        )
+        await runtime.appendSystemMessage(
+            channelId: executionChannelID,
+            content: "\(summaryLine)\(artifactLine)"
+        )
+        await deliverToChannelPlugin(
+            channelId: executionChannelID,
+            content: "\(summaryLine)\(artifactLine)"
+        )
+    }
+
+    private func failSwarmRootWithEscalation(
+        projectID: String,
+        rootTaskID: String,
+        failedTaskID: String?,
+        reason: String,
+        executionChannelID: String,
+        board: ActorBoardSnapshot
+    ) async {
+        guard var project = await store.project(id: projectID),
+              let rootIndex = project.tasks.firstIndex(where: { $0.id == rootTaskID })
+        else {
+            return
+        }
+
+        var rootTask = project.tasks[rootIndex]
+        rootTask.status = "blocked"
+        rootTask.updatedAt = Date()
+        if rootTask.description.isEmpty {
+            rootTask.description = reason
+        } else if !rootTask.description.contains(reason) {
+            rootTask.description += "\n\n\(reason)"
+        }
+        project.tasks[rootIndex] = rootTask
+
+        var blockedDownstreamTaskIDs: [String] = []
+        if let swarmID = rootTask.swarmId,
+           let failedTaskID,
+           let failedIndex = project.tasks.firstIndex(where: { $0.id == failedTaskID }),
+           let failedSwarmTaskID = project.tasks[failedIndex].swarmTaskId {
+            project.tasks[failedIndex] = markSwarmTaskBlocked(
+                project.tasks[failedIndex],
+                reasonLine: "Swarm failed: \(reason)"
+            )
+
+            let swarmChildren = project.tasks.filter { $0.swarmId == swarmID && $0.id != rootTaskID }
+            let downstreamSwarmTaskIDs = downstreamSwarmTaskIDs(
+                from: failedSwarmTaskID,
+                children: swarmChildren
+            )
+            for downstreamSwarmTaskID in downstreamSwarmTaskIDs {
+                guard let index = project.tasks.firstIndex(where: {
+                    $0.swarmId == swarmID && $0.swarmTaskId == downstreamSwarmTaskID
+                }) else {
+                    continue
+                }
+                var task = project.tasks[index]
+                guard task.status != "done", task.status != "blocked" else {
+                    continue
+                }
+                task = markSwarmTaskBlocked(
+                    task,
+                    reasonLine: "Blocked by failed dependency \(failedSwarmTaskID)."
+                )
+                blockedDownstreamTaskIDs.append(task.id)
+                project.tasks[index] = task
+            }
+        }
+
+        project.updatedAt = Date()
+        await store.saveProject(project)
+
+        let failedTask = failedTaskID.flatMap { id in
+            project.tasks.first(where: { $0.id == id })
+        }
+        let escalationChannelID = resolveSwarmEscalationChannelID(
+            failedTask: failedTask,
+            board: board,
+            fallbackChannelID: executionChannelID
+        )
+        let artifactRefs = failedTask.map { extractArtifactRefs(from: $0.description) } ?? []
+        let message =
+            """
+            Swarm escalation required.
+            Root task: \(rootTaskID)
+            Failed child: \(failedTaskID ?? "n/a")
+            Reason: \(reason)
+            Blocked downstream: \(blockedDownstreamTaskIDs.isEmpty ? "none" : blockedDownstreamTaskIDs.joined(separator: ", "))
+            Artifacts: \(artifactRefs.isEmpty ? "none" : artifactRefs.joined(separator: ", "))
+            Action: Please review and unblock the task.
+            """
+
+        let logMessage: String
+        if blockedDownstreamTaskIDs.isEmpty {
+            logMessage = reason
+        } else {
+            logMessage = "\(reason) Downstream blocked: \(blockedDownstreamTaskIDs.count)."
+        }
+
+        appendTaskLifecycleLog(
+            projectID: projectID,
+            taskID: rootTaskID,
+            stage: "swarm_blocked",
+            channelID: escalationChannelID,
+            workerID: nil,
+            message: logMessage,
+            artifactPath: artifactRefs.first
+        )
+        await runtime.appendSystemMessage(channelId: escalationChannelID, content: message)
+        await deliverToChannelPlugin(channelId: escalationChannelID, content: message)
+    }
+
+    private func markSwarmTaskBlocked(_ task: ProjectTask, reasonLine: String) -> ProjectTask {
+        var task = task
+        task.status = "blocked"
+        task.updatedAt = Date()
+        if task.description.isEmpty {
+            task.description = reasonLine
+        } else if !task.description.contains(reasonLine) {
+            task.description += "\n\n\(reasonLine)"
+        }
+        return task
+    }
+
+    private func downstreamSwarmTaskIDs(
+        from failedSwarmTaskID: String,
+        children: [ProjectTask]
+    ) -> Set<String> {
+        var dependentsByDependency: [String: Set<String>] = [:]
+        for task in children {
+            guard let swarmTaskID = task.swarmTaskId else {
+                continue
+            }
+            for dependency in task.swarmDependencyIds ?? [] {
+                dependentsByDependency[dependency, default: []].insert(swarmTaskID)
+            }
+        }
+
+        var queue = Array(dependentsByDependency[failedSwarmTaskID] ?? [])
+        var visited: Set<String> = []
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            guard visited.insert(current).inserted else {
+                continue
+            }
+            queue.append(contentsOf: dependentsByDependency[current] ?? [])
+        }
+        return visited
+    }
+
+    private func resolveSwarmEscalationChannelID(
+        failedTask: ProjectTask?,
+        board: ActorBoardSnapshot,
+        fallbackChannelID: String
+    ) -> String {
+        let nodesByID = Dictionary(uniqueKeysWithValues: board.nodes.map { ($0.id, $0) })
+        if let actorPath = failedTask?.swarmActorPath {
+            for actorID in actorPath.reversed() {
+                guard let actor = nodesByID[actorID], actor.kind == .human else {
+                    continue
+                }
+                let channelID = normalizeWhitespace(actor.channelId ?? "")
+                if !channelID.isEmpty {
+                    return channelID
+                }
+            }
+        }
+
+        if let admin = nodesByID["human:admin"] {
+            let channelID = normalizeWhitespace(admin.channelId ?? "")
+            if !channelID.isEmpty {
+                return channelID
+            }
+        }
+
+        return fallbackChannelID
+    }
+
+    private func swarmActorPath(
+        rootActorID: String,
+        targetActorID: String,
+        parentByActor: [String: String]
+    ) -> [String] {
+        if targetActorID == rootActorID {
+            return [rootActorID]
+        }
+
+        var path: [String] = [targetActorID]
+        var current = targetActorID
+        while let parent = parentByActor[current] {
+            path.append(parent)
+            if parent == rootActorID {
+                break
+            }
+            current = parent
+        }
+        return path.reversed()
+    }
+
+    private func extractArtifactRefs(from description: String) -> [String] {
+        description
+            .components(separatedBy: .newlines)
+            .compactMap { line -> String? in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed.lowercased().hasPrefix("artifact: ") else {
+                    return nil
+                }
+                return String(trimmed.dropFirst("Artifact: ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { !$0.isEmpty }
+    }
+
     private func resolveTaskDelegation(project: ProjectRecord, task: ProjectTask) async -> TaskDelegation? {
         let board = try? getActorBoard()
         let nodesByID = Dictionary(uniqueKeysWithValues: (board?.nodes ?? []).map { ($0.id, $0) })
@@ -2129,6 +2704,30 @@ public actor CoreService {
             )
         }
         return nil
+    }
+
+    private func resolveSwarmTaskDelegation(project: ProjectRecord, task: ProjectTask) async -> TaskDelegation? {
+        let board = try? getActorBoard()
+        let nodesByID = Dictionary(uniqueKeysWithValues: (board?.nodes ?? []).map { ($0.id, $0) })
+        let actorID = normalizeWhitespace(task.claimedActorId ?? task.actorId ?? "")
+        guard !actorID.isEmpty else {
+            return nil
+        }
+
+        let resolvedNode = nodesByID[actorID]
+        let directChannelID = normalizeWhitespace(resolvedNode?.channelId ?? "")
+        let channelID = directChannelID.isEmpty
+            ? resolveExecutionChannelID(project: project, task: task)
+            : directChannelID
+        guard let channelID else {
+            return nil
+        }
+
+        return TaskDelegation(
+            actorID: actorID,
+            agentID: resolvedNode?.linkedAgentId,
+            channelID: channelID
+        )
     }
 
     private func preferredActorIDs(for task: ProjectTask, board: ActorBoardSnapshot?) -> [String] {
@@ -3695,12 +4294,51 @@ public actor CoreService {
                 let stream = await runtime.eventBus.subscribe()
                 continuation.resume()
                 for await event in stream {
-                    await store.persist(event: event)
-                    await handleVisorEvent(event)
-                    await extractAndPersistTokenUsage(from: event)
+                    let enrichedEvent = await eventByInjectingSwarmMetadata(event)
+                    await store.persist(event: enrichedEvent)
+                    await handleVisorEvent(enrichedEvent)
+                    await extractAndPersistTokenUsage(from: enrichedEvent)
                 }
             }
         }
+    }
+
+    private func eventByInjectingSwarmMetadata(_ event: EventEnvelope) async -> EventEnvelope {
+        guard let taskID = event.taskId else {
+            return event
+        }
+
+        let projects = await store.listProjects()
+        var resolvedTask: ProjectTask?
+        for project in projects {
+            if let task = project.tasks.first(where: { $0.id == taskID }) {
+                resolvedTask = task
+                break
+            }
+        }
+        guard let task = resolvedTask, let swarmId = task.swarmId else {
+            return event
+        }
+
+        var envelope = event
+        var swarmPayload: [String: JSONValue] = [
+            "swarmId": .string(swarmId)
+        ]
+        if let swarmTaskId = task.swarmTaskId {
+            swarmPayload["swarmTaskId"] = .string(swarmTaskId)
+        }
+        if let swarmParentTaskId = task.swarmParentTaskId {
+            swarmPayload["swarmParentTaskId"] = .string(swarmParentTaskId)
+        }
+        if let dependencyIds = task.swarmDependencyIds, !dependencyIds.isEmpty {
+            swarmPayload["swarmDependencyIds"] = .array(dependencyIds.map { .string($0) })
+        }
+        if let actorPath = task.swarmActorPath, !actorPath.isEmpty {
+            swarmPayload["swarmActorPath"] = .array(actorPath.map { .string($0) })
+        }
+
+        envelope.extensions["swarm"] = .object(swarmPayload)
+        return envelope
     }
 
     /// Extracts token usage from branch.conclusion and worker.completed events.

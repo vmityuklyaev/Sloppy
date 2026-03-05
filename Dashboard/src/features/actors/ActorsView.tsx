@@ -17,6 +17,7 @@ import {
 const NODE_WIDTH = 180;
 const NODE_HEIGHT = 88;
 const SOCKETS = ["top", "right", "bottom", "left"];
+const RELATIONSHIPS = ["hierarchical", "peer"];
 
 function createEmptyBoard() {
   return {
@@ -70,14 +71,21 @@ function normalizeLink(item, index, nodeIds) {
 
   const direction = asString(item?.direction, "one_way");
   const communicationType = asString(item?.communicationType, "chat");
+  const sourceSocket = normalizeSocket(item?.sourceSocket, "right");
+  const targetSocket = normalizeSocket(item?.targetSocket, "left");
+  const relationshipValue = asString(item?.relationship, "");
+  const relationship = RELATIONSHIPS.includes(relationshipValue)
+    ? relationshipValue
+    : inferRelationshipFromSockets(sourceSocket, targetSocket);
   return {
     id,
     sourceActorId,
     targetActorId,
     direction: direction === "two_way" ? "two_way" : "one_way",
+    relationship,
     communicationType: ["chat", "task", "event", "discussion"].includes(communicationType) ? communicationType : "chat",
-    sourceSocket: normalizeSocket(item?.sourceSocket, "right"),
-    targetSocket: normalizeSocket(item?.targetSocket, "left"),
+    sourceSocket,
+    targetSocket,
     createdAt: item?.createdAt || new Date().toISOString()
   };
 }
@@ -188,6 +196,16 @@ function normalizeSocket(value, fallback = "right") {
   return SOCKETS.includes(socket) ? socket : fallback;
 }
 
+function inferRelationshipFromSockets(sourceSocket, targetSocket) {
+  if (
+    (sourceSocket === "bottom" && targetSocket === "top")
+    || (sourceSocket === "top" && targetSocket === "bottom")
+  ) {
+    return "hierarchical";
+  }
+  return "peer";
+}
+
 function socketPoint(node, socket) {
   switch (socket) {
     case "top":
@@ -264,6 +282,7 @@ export function ActorsView() {
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [selectedLinkId, setSelectedLinkId] = useState(null);
   const [linkDirection, setLinkDirection] = useState("one_way");
+  const [linkRelationship, setLinkRelationship] = useState("peer");
   const [linkCommunicationType, setLinkCommunicationType] = useState("chat");
   const [newActorName, setNewActorName] = useState("");
   const [newActorKind, setNewActorKind] = useState("human");
@@ -623,8 +642,12 @@ export function ActorsView() {
       return;
     }
     setLinkDirection(selectedLink.direction);
+    setLinkRelationship(selectedLink.relationship || inferRelationshipFromSockets(
+      normalizeSocket(selectedLink.sourceSocket, "right"),
+      normalizeSocket(selectedLink.targetSocket, "left")
+    ));
     setLinkCommunicationType(selectedLink.communicationType);
-  }, [selectedLinkId, selectedLink?.id, selectedLink?.direction, selectedLink?.communicationType]);
+  }, [selectedLinkId, selectedLink?.id, selectedLink?.direction, selectedLink?.relationship, selectedLink?.communicationType, selectedLink?.sourceSocket, selectedLink?.targetSocket]);
 
   async function createLink(sourceNodeId, sourceSocket, targetNodeId, targetSocket) {
     if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) {
@@ -634,11 +657,16 @@ export function ActorsView() {
 
     const normalizedSourceSocket = normalizeSocket(sourceSocket, "right");
     const normalizedTargetSocket = normalizeSocket(targetSocket, "left");
+    const relationship = inferRelationshipFromSockets(normalizedSourceSocket, normalizedTargetSocket);
     const duplicate = boardRef.current.links.find(
       (link) =>
         link.sourceActorId === sourceNodeId &&
         link.targetActorId === targetNodeId &&
         link.direction === linkDirection &&
+        (link.relationship || inferRelationshipFromSockets(
+          normalizeSocket(link.sourceSocket, "right"),
+          normalizeSocket(link.targetSocket, "left")
+        )) === relationship &&
         link.communicationType === linkCommunicationType &&
         normalizeSocket(link.sourceSocket, "right") === normalizedSourceSocket &&
         normalizeSocket(link.targetSocket, "left") === normalizedTargetSocket
@@ -657,6 +685,7 @@ export function ActorsView() {
       sourceActorId: sourceNodeId,
       targetActorId: targetNodeId,
       direction: linkDirection,
+      relationship,
       communicationType: linkCommunicationType,
       sourceSocket: normalizedSourceSocket,
       targetSocket: normalizedTargetSocket,
@@ -828,7 +857,11 @@ export function ActorsView() {
       linkId: link.id,
       anchorX: anchorPoint.x,
       anchorY: anchorPoint.y,
-      direction: link.direction
+      direction: link.direction,
+      relationship: link.relationship || inferRelationshipFromSockets(
+        normalizeSocket(link.sourceSocket, "right"),
+        normalizeSocket(link.targetSocket, "left")
+      )
     });
   }
 
@@ -852,6 +885,32 @@ export function ActorsView() {
     const response = await updateActorLink(link.id, {
       ...link,
       direction: newDirection
+    });
+    setIsSaving(false);
+
+    if (response) {
+      applyBoardResponse(response, "Link updated");
+    }
+  }
+
+  async function updateLinkRelationship(newRelationship) {
+    if (!linkMenu || !RELATIONSHIPS.includes(newRelationship)) {
+      return;
+    }
+
+    const link = boardRef.current.links.find((entry) => entry.id === linkMenu.linkId);
+    if (!link) {
+      setLinkMenu(null);
+      return;
+    }
+
+    setLinkMenu((previous) => (previous ? { ...previous, relationship: newRelationship } : previous));
+    setLinkRelationship(newRelationship);
+
+    setIsSaving(true);
+    const response = await updateActorLink(link.id, {
+      ...link,
+      relationship: newRelationship
     });
     setIsSaving(false);
 
@@ -1238,6 +1297,22 @@ export function ActorsView() {
                       onClick={() => void updateLinkDirection("two_way")}
                     >
                       Two-Way
+                    </button>
+                  </div>
+                  <div className="actor-link-menu-actions">
+                    <button
+                      type="button"
+                      className={(linkMenu.relationship || linkRelationship) === "hierarchical" ? "active" : ""}
+                      onClick={() => void updateLinkRelationship("hierarchical")}
+                    >
+                      Hierarchical
+                    </button>
+                    <button
+                      type="button"
+                      className={(linkMenu.relationship || linkRelationship) === "peer" ? "active" : ""}
+                      onClick={() => void updateLinkRelationship("peer")}
+                    >
+                      Peer
                     </button>
                   </div>
                 </div>

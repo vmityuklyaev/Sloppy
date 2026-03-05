@@ -44,6 +44,7 @@ interface RuntimeEvent {
   branchId?: string;
   workerId?: string;
   payload?: unknown;
+  extensions?: AnyRecord;
 }
 
 interface SubmitEventLike {
@@ -102,7 +103,8 @@ function normalizeRuntimeEvents(payload: unknown): RuntimeEvent[] {
       taskId: typeof row.taskId === "string" ? row.taskId : undefined,
       branchId: typeof row.branchId === "string" ? row.branchId : undefined,
       workerId: typeof row.workerId === "string" ? row.workerId : undefined,
-      payload: row.payload
+      payload: row.payload,
+      extensions: row.extensions && typeof row.extensions === "object" ? (row.extensions as AnyRecord) : undefined
     });
   }
 

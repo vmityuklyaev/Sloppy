@@ -61,7 +61,12 @@ export function RuntimeOverviewView({
         <h2>Activity Feed</h2>
         <div className="feed">
           {events.map((event) => {
+            const swarm = event.extensions && typeof event.extensions === "object" ? event.extensions.swarm : null;
+            const swarmRef = swarm && typeof swarm === "object" && typeof swarm.swarmId === "string"
+              ? `swarm:${swarm.swarmId}`
+              : null;
             const refs = [
+              swarmRef,
               event.taskId ? `task:${event.taskId}` : null,
               event.branchId ? `branch:${event.branchId}` : null,
               event.workerId ? `worker:${event.workerId}` : null

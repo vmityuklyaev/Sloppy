@@ -119,6 +119,12 @@ public struct ProjectTask: Codable, Sendable, Equatable {
     public var teamId: String?
     public var claimedActorId: String?
     public var claimedAgentId: String?
+    public var swarmId: String?
+    public var swarmTaskId: String?
+    public var swarmParentTaskId: String?
+    public var swarmDependencyIds: [String]?
+    public var swarmDepth: Int?
+    public var swarmActorPath: [String]?
     public var createdAt: Date
     public var updatedAt: Date
 
@@ -132,6 +138,12 @@ public struct ProjectTask: Codable, Sendable, Equatable {
         teamId: String? = nil,
         claimedActorId: String? = nil,
         claimedAgentId: String? = nil,
+        swarmId: String? = nil,
+        swarmTaskId: String? = nil,
+        swarmParentTaskId: String? = nil,
+        swarmDependencyIds: [String]? = nil,
+        swarmDepth: Int? = nil,
+        swarmActorPath: [String]? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -144,6 +156,12 @@ public struct ProjectTask: Codable, Sendable, Equatable {
         self.teamId = teamId
         self.claimedActorId = claimedActorId
         self.claimedAgentId = claimedAgentId
+        self.swarmId = swarmId
+        self.swarmTaskId = swarmTaskId
+        self.swarmParentTaskId = swarmParentTaskId
+        self.swarmDependencyIds = swarmDependencyIds
+        self.swarmDepth = swarmDepth
+        self.swarmActorPath = swarmActorPath
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -1054,6 +1072,11 @@ public enum ActorLinkDirection: String, Codable, Sendable {
     case twoWay = "two_way"
 }
 
+public enum ActorRelationshipType: String, Codable, Sendable {
+    case hierarchical
+    case peer
+}
+
 public enum ActorCommunicationType: String, Codable, Sendable {
     case chat
     case task
@@ -1107,6 +1130,7 @@ public struct ActorLink: Codable, Sendable, Equatable {
     public var sourceActorId: String
     public var targetActorId: String
     public var direction: ActorLinkDirection
+    public var relationship: ActorRelationshipType?
     public var communicationType: ActorCommunicationType
     public var sourceSocket: ActorSocketPosition?
     public var targetSocket: ActorSocketPosition?
@@ -1117,6 +1141,7 @@ public struct ActorLink: Codable, Sendable, Equatable {
         sourceActorId: String,
         targetActorId: String,
         direction: ActorLinkDirection,
+        relationship: ActorRelationshipType? = nil,
         communicationType: ActorCommunicationType,
         sourceSocket: ActorSocketPosition? = nil,
         targetSocket: ActorSocketPosition? = nil,
@@ -1126,6 +1151,7 @@ public struct ActorLink: Codable, Sendable, Equatable {
         self.sourceActorId = sourceActorId
         self.targetActorId = targetActorId
         self.direction = direction
+        self.relationship = relationship
         self.communicationType = communicationType
         self.sourceSocket = sourceSocket
         self.targetSocket = targetSocket

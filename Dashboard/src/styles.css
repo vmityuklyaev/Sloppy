@@ -1465,6 +1465,128 @@ body.mobile-menu-open {
   color: var(--muted);
 }
 
+.project-swarm-overview {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 12px;
+  background: rgba(8, 13, 22, 0.72);
+}
+
+.project-swarm-list {
+  display: grid;
+  gap: 10px;
+}
+
+.project-swarm-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(11, 16, 25, 0.85);
+  display: grid;
+  gap: 8px;
+}
+
+.project-swarm-card-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.project-swarm-card-head strong {
+  color: var(--text);
+}
+
+.project-swarm-card-head span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.project-swarm-tree {
+  display: grid;
+  gap: 6px;
+}
+
+.project-swarm-node {
+  display: grid;
+  gap: 6px;
+}
+
+.project-swarm-node-main {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(6, 10, 17, 0.9);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-swarm-node-main:hover {
+  border-color: var(--line-strong);
+  background: rgba(10, 15, 24, 0.92);
+}
+
+.project-swarm-status {
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--line);
+}
+
+.project-swarm-status--done {
+  color: #bbf7d0;
+  border-color: rgba(34, 197, 94, 0.7);
+}
+
+.project-swarm-status--in_progress {
+  color: #fde68a;
+  border-color: rgba(245, 158, 11, 0.7);
+}
+
+.project-swarm-status--ready {
+  color: #bfdbfe;
+  border-color: rgba(59, 130, 246, 0.7);
+}
+
+.project-swarm-status--blocked {
+  color: #fecaca;
+  border-color: rgba(239, 68, 68, 0.7);
+}
+
+.project-swarm-status--backlog {
+  color: #cbd5e1;
+  border-color: rgba(71, 85, 105, 0.7);
+}
+
+.project-swarm-node-title {
+  font-size: 0.82rem;
+  color: var(--text);
+}
+
+.project-swarm-node-meta {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 0.69rem;
+  color: var(--muted);
+}
+
+.project-swarm-node-children {
+  display: grid;
+  gap: 6px;
+}
+
 .project-kanban-board {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1527,6 +1649,16 @@ body.mobile-menu-open {
 .project-kanban-column-head--in_progress span,
 .project-kanban-column-head--in_progress strong {
   color: #fde68a;
+}
+
+.project-kanban-column-head--blocked {
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.32) 0%, rgba(185, 28, 28, 0.42) 100%);
+  border-bottom-color: rgba(239, 68, 68, 0.5);
+}
+
+.project-kanban-column-head--blocked span,
+.project-kanban-column-head--blocked strong {
+  color: #fecaca;
 }
 
 .project-kanban-column-head--done {

@@ -1456,6 +1456,73 @@ func actorRouteEndpointResolvesRecipientsFromLinks() async throws {
 }
 
 @Test
+func actorBoardInfersHierarchicalRelationshipFromSockets() async throws {
+    let workspaceName = "workspace-actor-relationship-\(UUID().uuidString)"
+    let sqlitePath = FileManager.default.temporaryDirectory
+        .appendingPathComponent("core-actor-relationship-\(UUID().uuidString).sqlite")
+        .path
+
+    var config = CoreConfig.default
+    config.workspace = .init(name: workspaceName, basePath: FileManager.default.temporaryDirectory.path)
+    config.sqlitePath = sqlitePath
+
+    let service = CoreService(config: config)
+    let router = CoreRouter(service: service)
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+
+    let createAgentBody = try encoder.encode(
+        AgentCreateRequest(
+            id: "child-agent",
+            displayName: "Child Agent",
+            role: "Hierarchy target"
+        )
+    )
+    let createAgentResponse = await router.handle(method: "POST", path: "/v1/agents", body: createAgentBody)
+    #expect(createAgentResponse.status == 201)
+
+    let initialBoardResponse = await router.handle(method: "GET", path: "/v1/actors/board", body: nil)
+    #expect(initialBoardResponse.status == 200)
+    let initialBoard = try decoder.decode(ActorBoardSnapshot.self, from: initialBoardResponse.body)
+
+    var nodes = initialBoard.nodes
+    nodes.append(
+        ActorNode(
+            id: "agent:child",
+            displayName: "Child Agent",
+            kind: .agent,
+            linkedAgentId: "child-agent",
+            channelId: "agent:child"
+        )
+    )
+
+    let updateRequest = ActorBoardUpdateRequest(
+        nodes: nodes,
+        links: [
+            ActorLink(
+                id: "link-admin-child-task",
+                sourceActorId: "human:admin",
+                targetActorId: "agent:child",
+                direction: .oneWay,
+                communicationType: .task,
+                sourceSocket: .bottom,
+                targetSocket: .top
+            )
+        ],
+        teams: []
+    )
+
+    let updateBody = try encoder.encode(updateRequest)
+    let updateResponse = await router.handle(method: "PUT", path: "/v1/actors/board", body: updateBody)
+    #expect(updateResponse.status == 200)
+    let updatedBoard = try decoder.decode(ActorBoardSnapshot.self, from: updateResponse.body)
+    let updatedLink = try #require(updatedBoard.links.first(where: { $0.id == "link-admin-child-task" }))
+    #expect(updatedLink.relationship == .hierarchical)
+}
+
+@Test
 func actorCRUDEndpointsManageNodesLinksAndTeams() async throws {
     let workspaceName = "workspace-actor-crud-\(UUID().uuidString)"
     let sqlitePath = FileManager.default.temporaryDirectory

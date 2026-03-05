@@ -385,6 +385,19 @@ public actor RuntimeSystem {
         return true
     }
 
+    /// Performs one-shot completion with currently configured model provider.
+    /// Returns nil when no provider/model is configured or completion fails.
+    public func complete(prompt: String, maxTokens: Int = 1024) async -> String? {
+        guard let modelProvider, let defaultModel else {
+            return nil
+        }
+        return try? await modelProvider.complete(
+            model: defaultModel,
+            prompt: prompt,
+            maxTokens: maxTokens
+        )
+    }
+
     /// Creates worker and attaches it to channel tracking.
     public func createWorker(spec: WorkerTaskSpec) async -> String {
         let workerId = await workers.spawn(spec: spec, autoStart: true)
