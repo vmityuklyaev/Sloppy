@@ -205,11 +205,38 @@ public actor RuntimeSystem {
                 let maxToolSteps = 8
 
                 for _ in 0..<maxToolSteps {
-                    let latest = try await modelProvider.complete(
-                        model: defaultModel,
-                        prompt: currentPrompt,
-                        maxTokens: 1024
-                    )
+                    var latest = ""
+                    let stream = modelProvider.stream(model: defaultModel, prompt: currentPrompt, maxTokens: 1024)
+                    for try await partial in stream {
+                        latest = partial
+                        if let onResponseChunk {
+                            let shouldContinue = await onResponseChunk(latest)
+                            if !shouldContinue {
+                                if !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    await channels.appendSystemMessage(channelId: channelId, content: latest)
+                                }
+                                return
+                            }
+                        }
+                    }
+
+                    if latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        latest = try await modelProvider.complete(
+                            model: defaultModel,
+                            prompt: currentPrompt,
+                            maxTokens: 1024
+                        )
+                        if let onResponseChunk {
+                            let shouldContinue = await onResponseChunk(latest)
+                            if !shouldContinue {
+                                if !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    await channels.appendSystemMessage(channelId: channelId, content: latest)
+                                }
+                                return
+                            }
+                        }
+                    }
+
                     let trimmed = latest.trimmingCharacters(in: .whitespacesAndNewlines)
 
                     if let call = parseToolCall(from: trimmed) {
@@ -230,12 +257,12 @@ public actor RuntimeSystem {
                             {"tool":"<tool-id>","arguments":{},"reason":"<short reason>"}
                             Otherwise return final answer in plain text.
                             """
+                        if let onResponseChunk {
+                            _ = await onResponseChunk("")
+                        }
                         continue
                     }
 
-                    if let onResponseChunk {
-                        _ = await onResponseChunk(latest)
-                    }
                     await channels.appendSystemMessage(channelId: channelId, content: latest)
                     return
                 }

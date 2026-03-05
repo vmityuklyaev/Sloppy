@@ -471,9 +471,12 @@ actor AgentSessionOrchestrator {
         let lastPersistedAt = streamedAssistantLastPersistedAtByChannel[channelID] ?? .distantPast
         let now = Date()
         let progressed = max(0, normalized.count - lastPersistedText.count)
+        let changed = normalized != lastPersistedText
+        let resetDetected = normalized.count < lastPersistedText.count
         let shouldPersist = lastPersistedText.isEmpty ||
-            progressed >= 24 ||
-            now.timeIntervalSince(lastPersistedAt) >= 0.35
+            (changed && progressed >= 8) ||
+            (changed && now.timeIntervalSince(lastPersistedAt) >= 0.12) ||
+            resetDetected
 
         if shouldPersist {
             do {

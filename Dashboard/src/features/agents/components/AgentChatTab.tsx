@@ -288,6 +288,19 @@ function formatEventTime(value) {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function latestRespondingTextFromEvents(events) {
+  const latest = [...(Array.isArray(events) ? events : [])]
+    .reverse()
+    .find(
+      (eventItem) =>
+        eventItem?.type === "run_status" &&
+        eventItem?.runStatus?.stage === "responding" &&
+        typeof eventItem?.runStatus?.expandedText === "string" &&
+        eventItem.runStatus.expandedText.length > 0
+    );
+  return latest?.runStatus?.expandedText || "";
+}
+
 async function encodeFileBase64(file) {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
@@ -1513,6 +1526,9 @@ export function AgentChatTab({ agentId }) {
       if (streamEvent.type === "message" && streamEvent.message?.role === "assistant") {
         setOptimisticAssistantText("");
       }
+      if (streamEvent.type === "message" && streamEvent.message?.role === "user") {
+        setOptimisticUserEvent(null);
+      }
     }
 
     if (kind === "session_closed") {
@@ -1617,6 +1633,9 @@ export function AgentChatTab({ agentId }) {
     setOptimisticAssistantText("");
     setIsSending(true);
     setStatusText("Thinking...");
+    setInputText("");
+    setPendingFiles([]);
+    setReplyTarget(null);
 
     let oversizedCount = 0;
     const uploads = await Promise.all(
@@ -1672,9 +1691,6 @@ export function AgentChatTab({ agentId }) {
         return;
       }
 
-      setInputText("");
-      setPendingFiles([]);
-      setReplyTarget(null);
       await refreshSessions(sessionId);
 
       if (oversizedCount > 0) {
@@ -1781,17 +1797,33 @@ export function AgentChatTab({ agentId }) {
   }
 
   const events = Array.isArray(activeSession?.events) ? activeSession.events : [];
+  const latestRunStatus = latestRunStatusFromEvents(events);
   const persistedMessages = events.filter(
     (eventItem) =>
       eventItem.type === "message" &&
       eventItem.message &&
       (eventItem.message.role === "user" || eventItem.message.role === "assistant")
   );
+  const streamedAssistantText = optimisticAssistantText || latestRespondingTextFromEvents(events);
+  const latestPersistedAssistantEvent = [...persistedMessages]
+    .reverse()
+    .find((eventItem) => eventItem?.message?.role === "assistant");
+  const latestPersistedAssistantText = latestPersistedAssistantEvent?.message?.segments
+    ? segmentsToPlainText(latestPersistedAssistantEvent.message.segments)
+    : "";
+  const normalizedStreamedAssistantText = String(streamedAssistantText || "").trim();
+  const hasDuplicatedPersistedAssistant =
+    normalizedStreamedAssistantText.length > 0 &&
+    normalizedStreamedAssistantText === String(latestPersistedAssistantText || "").trim();
+  const shouldRenderStreamMessage =
+    (isSending || latestRunStatus?.stage === "responding") &&
+    (normalizedStreamedAssistantText.length > 0 || isSending) &&
+    !hasDuplicatedPersistedAssistant;
   const chatMessages = [...persistedMessages];
   if (optimisticUserEvent) {
     chatMessages.push(optimisticUserEvent);
   }
-  if (isSending || optimisticAssistantText) {
+  if (shouldRenderStreamMessage) {
     chatMessages.push({
       id: "local-assistant-stream",
       createdAt: new Date().toISOString(),
@@ -1802,13 +1834,12 @@ export function AgentChatTab({ agentId }) {
         segments: [
           {
             kind: "text",
-            text: optimisticAssistantText || "Thinking..."
+            text: streamedAssistantText || "Thinking..."
           }
         ]
       }
     });
   }
-  const latestRunStatus = latestRunStatusFromEvents(events);
 
   const thinkingRecords = useMemo(() => {
     const list = chatMessages.flatMap((eventItem, index) => {
