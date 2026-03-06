@@ -346,12 +346,125 @@ function previewText(value, fallback = "No details") {
   return normalized;
 }
 
-function sortByNewest(list) {
-  return [...list].sort((left, right) => {
-    const leftDate = new Date(left?.createdAt || 0).getTime();
-    const rightDate = new Date(right?.createdAt || 0).getTime();
-    return rightDate - leftDate;
-  });
+function formatStructuredData(value) {
+  if (value == null) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildTechnicalRecord(eventItem, index) {
+  const eventKey = extractEventKey(eventItem, index);
+
+  if (eventItem?.type === "run_status" && eventItem.runStatus) {
+    const stage = String(eventItem.runStatus.stage || "").toLowerCase();
+    if (stage === "responding") {
+      return null;
+    }
+
+    const label = eventItem.runStatus.label || eventItem.runStatus.stage || "Status";
+    const summary = eventItem.runStatus.details || eventItem.runStatus.expandedText || label;
+    const detailParts = [];
+    if (eventItem.runStatus.stage) {
+      detailParts.push(`Stage: ${eventItem.runStatus.stage}`);
+    }
+    if (eventItem.runStatus.details) {
+      detailParts.push(eventItem.runStatus.details);
+    }
+    if (eventItem.runStatus.expandedText) {
+      detailParts.push(eventItem.runStatus.expandedText);
+    }
+
+    return {
+      id: `${eventKey}-run-status`,
+      icon: "progress_activity",
+      title: label,
+      summary: previewText(summary, label),
+      detail: detailParts.join("\n\n"),
+      createdAt: eventItem.createdAt || eventItem.runStatus.createdAt,
+      isActive: stage === "thinking" || stage === "searching"
+    };
+  }
+
+  if (eventItem?.type === "run_control" && eventItem.runControl) {
+    const action = eventItem.runControl.action || "control";
+    const title = `Control: ${action}`;
+    const detail = `Action: ${action}\nRequested by: ${eventItem.runControl.requestedBy || "unknown"}${
+      eventItem.runControl.reason ? `\nReason: ${eventItem.runControl.reason}` : ""
+    }`;
+
+    return {
+      id: `${eventKey}-run-control`,
+      icon: "tune",
+      title,
+      summary: previewText(eventItem.runControl.reason, title),
+      detail,
+      createdAt: eventItem.createdAt
+    };
+  }
+
+  if (eventItem?.type === "tool_call" && eventItem.toolCall) {
+    const reason = String(eventItem.toolCall.reason || "").trim();
+    const argumentsText = formatStructuredData(eventItem.toolCall.arguments);
+    const detail = `${reason ? `Reason: ${reason}\n\n` : ""}Arguments:\n${argumentsText || "{}"}`;
+
+    return {
+      id: `${eventKey}-tool-call`,
+      icon: "terminal",
+      title: `Tool call: ${eventItem.toolCall.tool || "tool"}`,
+      summary: previewText(reason || argumentsText, "Tool call"),
+      detail,
+      createdAt: eventItem.createdAt
+    };
+  }
+
+  if (eventItem?.type === "tool_result" && eventItem.toolResult) {
+    const statusText = eventItem.toolResult.ok ? "success" : "failed";
+    const dataText = formatStructuredData(eventItem.toolResult.data);
+    const errorText = formatStructuredData(eventItem.toolResult.error);
+    const parts = [`Status: ${statusText}`];
+    if (Number.isFinite(eventItem.toolResult.durationMs)) {
+      parts.push(`Duration: ${eventItem.toolResult.durationMs} ms`);
+    }
+    if (dataText) {
+      parts.push(`Data:\n${dataText}`);
+    }
+    if (errorText) {
+      parts.push(`Error:\n${errorText}`);
+    }
+
+    return {
+      id: `${eventKey}-tool-result`,
+      icon: eventItem.toolResult.ok ? "check_circle" : "error",
+      title: `Tool result: ${eventItem.toolResult.tool || "tool"}`,
+      summary: previewText(errorText || dataText, `Result: ${statusText}`),
+      detail: parts.join("\n\n"),
+      createdAt: eventItem.createdAt
+    };
+  }
+
+  if (eventItem?.type === "sub_session" && eventItem.subSession) {
+    const childSessionId = String(eventItem.subSession.childSessionId || "").trim();
+    const title = eventItem.subSession.title || "Sub-session";
+    return {
+      id: `${eventKey}-sub-session`,
+      icon: "call_split",
+      title,
+      summary: previewText(childSessionId, "Session created"),
+      detail: `Session: ${childSessionId}\nTitle: ${title}`,
+      createdAt: eventItem.createdAt,
+      childSessionId
+    };
+  }
+
+  return null;
 }
 
 function segmentsToPlainText(segments) {
@@ -582,14 +695,51 @@ function setCaretOffsetInEditor(root, offset) {
   selection.addRange(range);
 }
 
+function AgentChatExpandable({
+  recordId,
+  icon,
+  title,
+  summary,
+  isExpanded,
+  onToggle,
+  children
+}) {
+  return (
+    <section className={`agent-chat-expandable ${isExpanded ? "open" : ""}`}>
+      <button
+        type="button"
+        className="agent-chat-expandable-toggle"
+        onClick={() => onToggle(recordId)}
+        aria-expanded={isExpanded}
+      >
+        <span className="agent-chat-expandable-left">
+          <span className="material-symbols-rounded" aria-hidden="true">
+            {icon}
+          </span>
+          <span className="agent-chat-expandable-copy">
+            <strong>{title}</strong>
+            {summary ? <small>{summary}</small> : null}
+          </span>
+        </span>
+        <span className="material-symbols-rounded agent-chat-expandable-chevron" aria-hidden="true">
+          expand_more
+        </span>
+      </button>
+      {isExpanded ? <div className="agent-chat-expandable-body">{children}</div> : null}
+    </section>
+  );
+}
+
 function AgentChatEvents({
   isLoadingSession,
   isSending,
-  chatMessages,
+  timelineItems,
   latestRunStatus,
-  onOpenThinkingPanel,
+  expandedRecordIds,
+  onToggleRecord,
   onReplyToMessage,
   onCopyMessage,
+  onOpenSession,
   onTaskTagClick,
   onTaskTagHoverStart,
   onTaskTagHoverEnd
@@ -601,13 +751,13 @@ function AgentChatEvents({
       return;
     }
     scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [chatMessages, isLoadingSession, isSending, latestRunStatus?.id]);
+  }, [timelineItems, isLoadingSession, isSending, latestRunStatus?.id]);
 
   return (
     <div className="agent-chat-events" ref={scrollRef}>
       {isLoadingSession ? (
         <p className="placeholder-text">Loading session...</p>
-      ) : chatMessages.length === 0 && !isSending ? (
+      ) : timelineItems.length === 0 && !isSending ? (
         <p className="placeholder-text">No messages yet.</p>
       ) : (
         <>
@@ -618,10 +768,48 @@ function AgentChatEvents({
             </p>
           ) : null}
 
-          {chatMessages.map((eventItem, index) => {
-            const role = eventItem.message.role || "system";
-            const eventKey = extractEventKey(eventItem, index);
-            const segments = Array.isArray(eventItem.message?.segments) ? eventItem.message.segments : [];
+          {timelineItems.map((timelineItem, index) => {
+            if (timelineItem.kind === "technical" && timelineItem.record) {
+              const record = timelineItem.record;
+              const isExpanded = Boolean(expandedRecordIds[record.id]);
+
+              return (
+                <div key={timelineItem.id || `tech-${index}`} className="agent-chat-tech-entry">
+                  <button
+                    type="button"
+                    className={`agent-chat-tech-trigger ${isExpanded ? "expanded" : ""} ${record.isActive ? "shimmer" : ""}`}
+                    onClick={() => onToggleRecord(record.id)}
+                    aria-expanded={isExpanded}
+                  >
+                    <span className="agent-chat-tech-trigger-label">{record.title || "Technical event"}</span>
+                    <span className="material-symbols-rounded agent-chat-tech-trigger-arrow" aria-hidden="true">
+                      chevron_right
+                    </span>
+                  </button>
+                  {isExpanded ? (
+                    <article className="agent-chat-technical">
+                      <div className="agent-chat-technical-body">
+                        <pre className="agent-chat-expandable-pre">{record.detail || "No details."}</pre>
+                        {record.childSessionId ? (
+                          <button
+                            type="button"
+                            className="agent-chat-technical-link"
+                            onClick={() => onOpenSession(record.childSessionId)}
+                          >
+                            Open sub-session
+                          </button>
+                        ) : null}
+                      </div>
+                    </article>
+                  ) : null}
+                </div>
+              );
+            }
+
+            const eventItem = timelineItem.event;
+            const role = eventItem?.message?.role || "system";
+            const eventKey = timelineItem.id || extractEventKey(eventItem, index);
+            const segments = Array.isArray(eventItem?.message?.segments) ? eventItem.message.segments : [];
             const thinkingSegments = segments
               .map((segment, segmentIndex) => ({ ...segment, segmentIndex }))
               .filter((segment) => segment.kind === "thinking");
@@ -632,21 +820,33 @@ function AgentChatEvents({
               <article key={eventKey} className={`agent-chat-message ${role}`}>
                 <div className="agent-chat-message-head">
                   <strong>{role}</strong>
-                  <span>{formatEventTime(eventItem.message.createdAt || eventItem.createdAt)}</span>
+                  <span>{formatEventTime(eventItem?.message?.createdAt || eventItem?.createdAt)}</span>
                 </div>
                 <div className="agent-chat-message-body">
-                  {thinkingSegments.length > 0 ? (
-                    <button
-                      type="button"
-                      className="agent-chat-thinking-link"
-                      onClick={() => onOpenThinkingPanel(`${eventKey}-thinking-${thinkingSegments[0].segmentIndex}`)}
-                    >
-                      <span className="material-symbols-rounded" aria-hidden="true">
-                        psychology_alt
-                      </span>
-                      Thinking &gt;
-                    </button>
-                  ) : null}
+                  {thinkingSegments.map((segment) => {
+                    const thoughtId = `${eventKey}-thinking-${segment.segmentIndex}`;
+                    const thoughtText = String(segment.text || "").trim();
+                    return (
+                      <AgentChatExpandable
+                        key={thoughtId}
+                        recordId={thoughtId}
+                        icon="psychology_alt"
+                        title="Thinking"
+                        summary={previewText(thoughtText, "No details")}
+                        isExpanded={Boolean(expandedRecordIds[thoughtId])}
+                        onToggle={onToggleRecord}
+                      >
+                        <p className="agent-chat-expandable-text">
+                          <TaskTaggedText
+                            text={thoughtText || "No details."}
+                            onTaskTagClick={onTaskTagClick}
+                            onTaskTagHoverStart={onTaskTagHoverStart}
+                            onTaskTagHoverEnd={onTaskTagHoverEnd}
+                          />
+                        </p>
+                      </AgentChatExpandable>
+                    );
+                  })}
 
                   {visibleSegments.map((segment, segmentIndex) => {
                     const key = `${eventKey}-segment-${segmentIndex}`;
@@ -689,7 +889,7 @@ function AgentChatEvents({
                       title="Reply"
                       onClick={() =>
                         onReplyToMessage({
-                          id: eventItem.id || eventKey,
+                          id: eventItem?.id || eventKey,
                           text: previewText(messageText, "Assistant message")
                         })
                       }
@@ -1089,79 +1289,6 @@ function AgentChatComposer({
   );
 }
 
-function AgentChatInspector({
-  isOpen,
-  records,
-  selectedRecordId,
-  onSelectRecord,
-  onClose,
-  onOpenSession
-}) {
-  const selectedRecord = records.find((record) => record.id === selectedRecordId) || null;
-
-  function groupLabel(group) {
-    if (group === "thinking") {
-      return "Thinking";
-    }
-    if (group === "sub_session") {
-      return "Sub-session";
-    }
-    return "Log";
-  }
-
-  return (
-    <aside className={`agent-chat-inspector ${isOpen ? "open" : ""}`} aria-hidden={!isOpen}>
-      <div className="agent-chat-inspector-head">
-        <h4>Thinking</h4>
-        <button type="button" className="agent-chat-icon-button" onClick={onClose} aria-label="Close panel">
-          <span className="material-symbols-rounded" aria-hidden="true">
-            close
-          </span>
-        </button>
-      </div>
-
-      <div className="agent-chat-inspector-content">
-        {records.length === 0 ? (
-          <p className="placeholder-text">No process details yet.</p>
-        ) : (
-          <div className="agent-chat-inspector-list">
-            {records.map((item) => (
-              <button
-                key={item.id}
-                type="button"
-                className={`agent-chat-inspector-item ${selectedRecordId === item.id ? "active" : ""}`}
-                onClick={() => onSelectRecord(item.id)}
-              >
-                <div className="agent-chat-inspector-item-head">
-                  <strong>{item.title}</strong>
-                  <span>{formatEventTime(item.createdAt)}</span>
-                </div>
-                <p>{item.preview}</p>
-                <small>{groupLabel(item.group)}</small>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {selectedRecord ? (
-        <article className="agent-chat-inspector-details">
-          <div className="agent-chat-inspector-item-head">
-            <strong>{selectedRecord.title}</strong>
-            <span>{formatEventTime(selectedRecord.createdAt)}</span>
-          </div>
-          <pre>{selectedRecord.text}</pre>
-          {selectedRecord.group === "sub_session" && selectedRecord.childSessionId ? (
-            <button type="button" onClick={() => onOpenSession(selectedRecord.childSessionId)}>
-              Open sub-session
-            </button>
-          ) : null}
-        </article>
-      ) : null}
-    </aside>
-  );
-}
-
 export function AgentChatTab({ agentId }) {
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
@@ -1176,8 +1303,7 @@ export function AgentChatTab({ agentId }) {
   const [optimisticUserEvent, setOptimisticUserEvent] = useState(null);
   const [optimisticAssistantText, setOptimisticAssistantText] = useState("");
   const [replyTarget, setReplyTarget] = useState(null);
-  const [isInspectorOpen, setIsInspectorOpen] = useState(false);
-  const [selectedInspectorRecordId, setSelectedInspectorRecordId] = useState(null);
+  const [expandedRecordIds, setExpandedRecordIds] = useState({});
   const [knownTaskRecords, setKnownTaskRecords] = useState([]);
   const [taskPreview, setTaskPreview] = useState(null);
   const fileInputRef = useRef(null);
@@ -1345,8 +1471,7 @@ export function AgentChatTab({ agentId }) {
       setOptimisticUserEvent(null);
       setOptimisticAssistantText("");
       setReplyTarget(null);
-      setIsInspectorOpen(false);
-      setSelectedInspectorRecordId(null);
+      setExpandedRecordIds({});
       setIsSending(false);
       streamCleanupRef.current?.();
       streamCleanupRef.current = () => {};
@@ -1402,6 +1527,7 @@ export function AgentChatTab({ agentId }) {
     }
     setIsLoadingSession(true);
     setReplyTarget(null);
+    setExpandedRecordIds({});
     const detail = await fetchAgentSession(agentId, sessionId);
     if (!isCancelled) {
       if (detail) {
@@ -1524,7 +1650,10 @@ export function AgentChatTab({ agentId }) {
       }
 
       if (streamEvent.type === "message" && streamEvent.message?.role === "assistant") {
-        setOptimisticAssistantText("");
+        const streamedText = segmentsToPlainText(streamEvent.message.segments || []);
+        if (streamedText) {
+          setOptimisticAssistantText(streamedText);
+        }
       }
       if (streamEvent.type === "message" && streamEvent.message?.role === "user") {
         setOptimisticUserEvent(null);
@@ -1819,142 +1948,71 @@ export function AgentChatTab({ agentId }) {
     (isSending || latestRunStatus?.stage === "responding") &&
     (normalizedStreamedAssistantText.length > 0 || isSending) &&
     !hasDuplicatedPersistedAssistant;
-  const chatMessages = [...persistedMessages];
+  const timelineItems = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const eventItem = events[index];
+    const isChatMessage =
+      eventItem?.type === "message" &&
+      eventItem?.message &&
+      (eventItem.message.role === "user" || eventItem.message.role === "assistant");
+
+    if (isChatMessage) {
+      timelineItems.push({
+        id: extractEventKey(eventItem, index),
+        kind: "message",
+        event: eventItem
+      });
+      continue;
+    }
+
+    const technicalRecord = buildTechnicalRecord(eventItem, index);
+    if (technicalRecord) {
+      timelineItems.push({
+        id: technicalRecord.id,
+        kind: "technical",
+        record: technicalRecord
+      });
+    }
+  }
+
   if (optimisticUserEvent) {
-    chatMessages.push(optimisticUserEvent);
+    timelineItems.push({
+      id: extractEventKey(optimisticUserEvent, timelineItems.length),
+      kind: "message",
+      event: optimisticUserEvent
+    });
   }
+
   if (shouldRenderStreamMessage) {
-    chatMessages.push({
+    timelineItems.push({
       id: "local-assistant-stream",
-      createdAt: new Date().toISOString(),
-      type: "message",
-      message: {
-        role: "assistant",
+      kind: "message",
+      event: {
+        id: "local-assistant-stream",
         createdAt: new Date().toISOString(),
-        segments: [
-          {
-            kind: "text",
-            text: streamedAssistantText || "Thinking..."
-          }
-        ]
+        type: "message",
+        message: {
+          role: "assistant",
+          createdAt: new Date().toISOString(),
+          segments: [
+            {
+              kind: "text",
+              text: streamedAssistantText || "Thinking..."
+            }
+          ]
+        }
       }
     });
   }
 
-  const thinkingRecords = useMemo(() => {
-    const list = chatMessages.flatMap((eventItem, index) => {
-      const eventKey = extractEventKey(eventItem, index);
-      const createdAt = eventItem.message?.createdAt || eventItem.createdAt;
-      const thinkingSegments = (eventItem.message?.segments || [])
-        .map((segment, segmentIndex) => ({ ...segment, segmentIndex }))
-        .filter((segment) => segment.kind === "thinking");
-
-      return thinkingSegments.map((segment) => {
-        const text = String(segment.text || "").trim();
-        return {
-          id: `${eventKey}-thinking-${segment.segmentIndex}`,
-          group: "thinking",
-          sourceEventKey: eventKey,
-          createdAt,
-          title: thinkingSegments.length > 1 ? `Thought ${segment.segmentIndex + 1}` : "Thought",
-          preview: previewText(text),
-          text: text || "No details"
-        };
-      });
-    });
-
-    return sortByNewest(list);
-  }, [chatMessages]);
-
-  const subSessionRecords = useMemo(() => {
-    const list = events
-      .filter((eventItem) => eventItem.type === "sub_session" && eventItem.subSession)
-      .map((eventItem, index) => ({
-        id: `sub-session-${eventItem.id || index}`,
-        group: "sub_session",
-        createdAt: eventItem.createdAt,
-        title: eventItem.subSession.title || "Sub-session",
-        preview: previewText(eventItem.subSession.childSessionId, "Session created"),
-        text: `Session: ${eventItem.subSession.childSessionId}\nTitle: ${eventItem.subSession.title || "-"}`,
-        childSessionId: eventItem.subSession.childSessionId
-      }));
-
-    return sortByNewest(list);
-  }, [events]);
-
-  const logRecords = useMemo(() => {
-    const statusItems = events
-      .filter((eventItem) => eventItem.type === "run_status" && eventItem.runStatus)
-      .map((eventItem, index) => {
-        const label = eventItem.runStatus.label || eventItem.runStatus.stage || "Status";
-        const details = [eventItem.runStatus.details, eventItem.runStatus.expandedText].filter(Boolean).join("\n\n");
-        return {
-          id: `run-status-${eventItem.id || index}`,
-          group: "log",
-          createdAt: eventItem.createdAt || eventItem.runStatus.createdAt,
-          title: label,
-          preview: previewText(eventItem.runStatus.details || eventItem.runStatus.expandedText, label),
-          text: details || label
-        };
-      });
-
-    const controlItems = events
-      .filter((eventItem) => eventItem.type === "run_control" && eventItem.runControl)
-      .map((eventItem, index) => {
-        const label = `Control: ${eventItem.runControl.action}`;
-        return {
-          id: `run-control-${eventItem.id || index}`,
-          group: "log",
-          createdAt: eventItem.createdAt,
-          title: label,
-          preview: previewText(eventItem.runControl.reason, label),
-          text: `Action: ${eventItem.runControl.action}\nRequested by: ${eventItem.runControl.requestedBy}${
-            eventItem.runControl.reason ? `\nReason: ${eventItem.runControl.reason}` : ""
-          }`
-        };
-      });
-
-    return sortByNewest([...statusItems, ...controlItems]);
-  }, [events]);
-
-  const inspectorRecords = useMemo(
-    () => [...thinkingRecords, ...subSessionRecords, ...logRecords],
-    [thinkingRecords, subSessionRecords, logRecords]
-  );
-
-  const hasInspectorRecords = inspectorRecords.length > 0;
-
-  useEffect(() => {
-    if (!hasInspectorRecords) {
-      setSelectedInspectorRecordId(null);
+  function toggleExpandedRecord(recordId) {
+    if (!recordId) {
       return;
     }
-    if (!inspectorRecords.some((item) => item.id === selectedInspectorRecordId)) {
-      setSelectedInspectorRecordId(inspectorRecords[0].id);
-    }
-  }, [hasInspectorRecords, inspectorRecords, selectedInspectorRecordId]);
-
-  function openInspector(recordId = null) {
-    if (!hasInspectorRecords) {
-      return;
-    }
-    setIsInspectorOpen(true);
-
-    if (recordId && inspectorRecords.some((item) => item.id === recordId)) {
-      setSelectedInspectorRecordId(recordId);
-      return;
-    }
-
-    setSelectedInspectorRecordId((previous) => {
-      if (previous && inspectorRecords.some((item) => item.id === previous)) {
-        return previous;
-      }
-      return inspectorRecords[0].id;
-    });
-  }
-
-  function handleOpenThinkingPanel(recordId) {
-    openInspector(recordId);
+    setExpandedRecordIds((previous) => ({
+      ...previous,
+      [recordId]: !previous[recordId]
+    }));
   }
 
   return (
@@ -2002,17 +2060,6 @@ export function AgentChatTab({ agentId }) {
         <div className="agent-chat-actions">
           <button
             type="button"
-            className="agent-chat-icon-button"
-            onClick={() => openInspector()}
-            disabled={!hasInspectorRecords}
-            title="Thinking"
-          >
-            <span className="material-symbols-rounded" aria-hidden="true">
-              psychology_alt
-            </span>
-          </button>
-          <button
-            type="button"
             className="agent-chat-icon-button danger"
             onClick={handleDeleteActiveSession}
             disabled={!activeSessionId || isSending}
@@ -2025,16 +2072,18 @@ export function AgentChatTab({ agentId }) {
         </div>
       </div>
 
-      <div className={`agent-chat-workspace ${isInspectorOpen ? "inspector-open" : ""}`}>
+      <div className="agent-chat-workspace">
         <div className="agent-chat-thread">
           <AgentChatEvents
             isLoadingSession={isLoadingSession}
             isSending={isSending}
-            chatMessages={chatMessages}
+            timelineItems={timelineItems}
             latestRunStatus={latestRunStatus}
-            onOpenThinkingPanel={handleOpenThinkingPanel}
+            expandedRecordIds={expandedRecordIds}
+            onToggleRecord={toggleExpandedRecord}
             onReplyToMessage={handleReplyToMessage}
             onCopyMessage={handleCopyMessage}
+            onOpenSession={openSession}
             onTaskTagClick={openTaskReference}
             onTaskTagHoverStart={handleTaskTagHoverStart}
             onTaskTagHoverEnd={handleTaskTagHoverEnd}
@@ -2064,24 +2113,6 @@ export function AgentChatTab({ agentId }) {
             <p className="agent-chat-status-line placeholder-text">{statusText}</p>
           </div>
         </div>
-
-        {isInspectorOpen ? (
-          <button
-            type="button"
-            className="agent-chat-inspector-overlay"
-            onClick={() => setIsInspectorOpen(false)}
-            aria-label="Close process panel"
-          />
-        ) : null}
-
-        <AgentChatInspector
-          isOpen={isInspectorOpen}
-          records={inspectorRecords}
-          selectedRecordId={selectedInspectorRecordId}
-          onSelectRecord={setSelectedInspectorRecordId}
-          onClose={() => setIsInspectorOpen(false)}
-          onOpenSession={openSession}
-        />
       </div>
 
       {taskPreview ? (
